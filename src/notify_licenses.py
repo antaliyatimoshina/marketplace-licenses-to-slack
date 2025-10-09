@@ -46,24 +46,6 @@ else:
     start_date = today_utc - dt.timedelta(days=LOOKBACK_DAYS)
     end_date = today_utc
 
-def load_seen(path: str) -> set[str]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            j = json.load(f)
-        return set(j.get("ids", []))
-    except FileNotFoundError:
-        return set()
-    except Exception:
-        return set()
-
-def save_seen(path: str, ids: set[str]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(
-            {"ids": sorted(ids), "updated": dt.datetime.utcnow().isoformat() + "Z"},
-            f, indent=2
-        )
-
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     """
     Fetch licenses via the EXPORT endpoint (JSON) for a UTC date window.
@@ -224,11 +206,6 @@ def main():
     rows = pick_new_evaluations(items, start_date, end_date)  # rows have 'licenseId'
     print(f"Fetched {len(items)} raw items; mapped {len(rows)} rows; "
       f"example id: {rows[0].get('licenseId') if rows else '—'}")
-    
-    new_rows = [r for r in rows if r.get("licenseId") and r["licenseId"] not in seen]
-    if not new_rows:
-        print("No new licenses to post (all already seen).")
-        return
 
     post_to_slack(SLACK_WEBHOOK, new_rows, start_date, end_date)
 
