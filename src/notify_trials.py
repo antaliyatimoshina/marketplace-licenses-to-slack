@@ -38,17 +38,17 @@ end_date   = today_utc  # inclusive day; API uses start/end as dates
 
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     """
-    Fetch licenses for a UTC date window from Atlassian Marketplace Reporting API.
-    Uses dateType=start (license start date). Adds Accept header and handles
-    pagination where 'next' may be a string, or a dict with href/url.
+    Fetch licenses via the EXPORT endpoint (JSON) for a UTC date window.
+    This reliably includes evaluation/customer/entitlement fields.
     """
     base = "https://marketplace.atlassian.com"
-    url = f"{base}/rest/2/vendors/{vendor_id}/reporting/licenses"
+    url = f"{base}/rest/2/vendors/{vendor_id}/reporting/licenses/export"
     params = {
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
-        "dateType": "start",
-        "withDataInsights": "true"
+        "dateType": "start",        # filter by license start date
+        "accept": "json",           # export API returns JSON when accept=json
+        "withDataInsights": "true", # include evaluation/parent/attribution fields
     }
     auth = (MP_USER, MP_API_TOKEN)
     headers = {"Accept": "application/json"}
@@ -62,11 +62,10 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
     out = []
     while True:
-        r = requests.get(url, params=params, auth=auth, headers=headers, timeout=60)
+        r = requests.get(url, params=params, auth=auth, headers=headers, timeout=120)
         r.raise_for_status()
         data = r.json()
 
-        # Items may be top-level or nested under "licenses"
         items = data.get("licenses", data)
         if isinstance(items, dict) and "licenses" in items:
             items = items["licenses"]
@@ -74,7 +73,7 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
             items = []
         out.extend(items)
 
-        # Find 'next' (1) Link header, (2) body fields
+        # pagination (rare on export, but handle it just in case)
         next_url = None
         if isinstance(r.links.get("next"), dict):
             next_url = _normalize_next(r.links["next"])
@@ -91,10 +90,7 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
         if not next_url.startswith("http"):
             next_url = f"{base}{next_url}"
-
-        # Next page URL already contains its own query; clear params
         url, params = next_url, {}
-
     return out
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
