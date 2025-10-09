@@ -39,7 +39,7 @@ end_date   = today_utc  # inclusive day; API uses start/end as dates
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     """
     Fetch licenses via the EXPORT endpoint (JSON) for a UTC date window.
-    This reliably includes evaluation/customer/entitlement fields.
+    Robust to payload being either a list or an object wrapper.
     """
     base = "https://marketplace.atlassian.com"
     url = f"{base}/rest/2/vendors/{vendor_id}/reporting/licenses/export"
@@ -48,50 +48,39 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
         "endDate": end.isoformat(),
         "dateType": "start",        # filter by license start date
         "accept": "json",           # export API returns JSON when accept=json
-        "withDataInsights": "true", # include evaluation/parent/attribution fields
+        "withDataInsights": "true", # include evaluation/customer fields
     }
     auth = (MP_USER, MP_API_TOKEN)
     headers = {"Accept": "application/json"}
 
-    def _normalize_next(obj):
-        if isinstance(obj, str):
-            return obj
-        if isinstance(obj, dict):
-            return obj.get("url") or obj.get("href")
-        return None
+    r = requests.get(url, params=params, auth=auth, headers=headers, timeout=120)
+    r.raise_for_status()
+    payload = r.json()
 
-    out = []
-    while True:
-        r = requests.get(url, params=params, auth=auth, headers=headers, timeout=120)
-        r.raise_for_status()
-        data = r.json()
-
-        items = data.get("licenses", data)
-        if isinstance(items, dict) and "licenses" in items:
-            items = items["licenses"]
-        if not isinstance(items, list):
-            items = []
-        out.extend(items)
-
-        # pagination (rare on export, but handle it just in case)
-        next_url = None
-        if isinstance(r.links.get("next"), dict):
-            next_url = _normalize_next(r.links["next"])
-        if not next_url and isinstance(data, dict):
-            for k in ("_links", "links", "page", "paging"):
-                v = data.get(k)
+    def extract_items(p):
+        # If the API returns a bare array
+        if isinstance(p, list):
+            return p
+        # If it returns an object wrapper
+        if isinstance(p, dict):
+            for key in ("licenses", "items", "data", "results", "values"):
+                v = p.get(key)
+                if isinstance(v, list):
+                    return v
+            # nested containers some responses use
+            for key in ("content", "page", "paging", "_embedded"):
+                v = p.get(key)
                 if isinstance(v, dict):
-                    next_url = _normalize_next(v.get("next") or v.get("nextPage"))
-                    if next_url:
-                        break
+                    for k2 in ("licenses", "items", "data", "results", "values"):
+                        v2 = v.get(k2)
+                        if isinstance(v2, list):
+                            return v2
+            # single-record fallback
+            if any(k in p for k in ("licenseId", "appName", "customer", "evaluationStartDate")):
+                return [p]
+        return []
 
-        if not next_url:
-            break
-
-        if not next_url.startswith("http"):
-            next_url = f"{base}{next_url}"
-        url, params = next_url, {}
-    return out
+    return extract_items(payload)
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
