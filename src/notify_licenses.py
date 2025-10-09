@@ -30,11 +30,30 @@ SLACK_WEBHOOK = env("SLACK_WEBHOOK", required=True)
 
 APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.strip()])
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "0"))
+STATE_FILE = os.getenv("STATE_FILE", ".state/seen.json")
 
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
 start_date = today_utc - dt.timedelta(days=LOOKBACK_DAYS)
 end_date   = today_utc  # inclusive day; API uses start/end as dates
+
+def load_seen(path: str) -> set[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return set(j.get("ids", []))
+    except FileNotFoundError:
+        return set()
+    except Exception:
+        return set()
+
+def save_seen(path: str, ids: set[str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"ids": sorted(ids), "updated": dt.datetime.utcnow().isoformat() + "Z"},
+            f, indent=2
+        )
 
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     """
@@ -188,8 +207,22 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 
 def main():
     items = fetch_licenses(VENDOR_ID, start_date, end_date)
-    new_evals = pick_new_evaluations(items, start_date, end_date)
-    post_to_slack(SLACK_WEBHOOK, new_evals, start_date, end_date)
+    rows = pick_new_evaluations(items, start_date, end_date)  # rows have 'licenseId'
+
+    # Load/set seen IDs; skip rows we've already announced
+    seen = load_seen(STATE_FILE)
+
+    new_rows = [r for r in rows if r.get("licenseId") and r["licenseId"] not in seen]
+    if not new_rows:
+        print("No new licenses to post (all already seen).")
+        return
+
+    post_to_slack(SLACK_WEBHOOK, new_rows, start_date, end_date)
+
+    # Update state
+    for r in new_rows:
+        seen.add(r["licenseId"])
+    save_seen(STATE_FILE, seen)
 
 if __name__ == "__main__":
     main()
