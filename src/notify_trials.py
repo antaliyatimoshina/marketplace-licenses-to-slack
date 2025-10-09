@@ -84,9 +84,12 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
-    Keep only evaluation licenses and extract fields based on export payload.
-    We do NOT re-filter by date (dateType=start already did it).
+    Keep only evaluation licenses (or those with eval markers) and extract fields
+    for the new Slack format:
+      • {customer} · {contactName} ({contactEmail}) · {LICENSE_TYPE} [· {N users}]
+    We do NOT re-filter by date here (dateType=start already did).
     """
+    import re
 
     def g(d, path):
         cur = d
@@ -105,14 +108,15 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
                 return v
         return None
 
-    def email_domain(email: str | None):
-        if isinstance(email, str) and "@" in email:
-            return email.split("@", 1)[1]
+    def users_from_tier(tier):
+        if isinstance(tier, str):
+            m = re.search(r"(\d+)\s*Users?", tier, re.I)
+            if m:
+                return int(m.group(1))
         return None
 
     wanted = []
     for lic in items:
-        # Treat as evaluation if licenseType/tier says so or eval markers exist
         is_eval = (
             (lic.get("licenseType") == "EVALUATION") or
             (lic.get("tier") == "Evaluation") or
@@ -125,75 +129,75 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
 
         app_name = first(lic.get("addonName"), g(lic, "app.name"), lic.get("appName"), "Unknown app")
 
-        # CUSTOMER: prefer company; then contact names; then site hostname; then email domain
-        company = g(lic, "contactDetails.company")
-        tech_name = g(lic, "contactDetails.technicalContact.name")
-        bill_name = g(lic, "contactDetails.billingContact.name")
-        site = lic.get("cloudSiteHostname")
-        tech_email = g(lic, "contactDetails.technicalContact.email")
-        bill_email = g(lic, "contactDetails.billingContact.email")
+        # Customer: prefer company, then site hostname, then contact name/email domain
+        company     = g(lic, "contactDetails.company")
+        site        = lic.get("cloudSiteHostname")
+        tech_name   = g(lic, "contactDetails.technicalContact.name")
+        bill_name   = g(lic, "contactDetails.billingContact.name")
+        tech_email  = g(lic, "contactDetails.technicalContact.email")
+        bill_email  = g(lic, "contactDetails.billingContact.email")
+
+        def email_domain(email):
+            return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
 
         customer = first(
             company,
-            tech_name,
-            bill_name,
             site,
             email_domain(tech_email),
             email_domain(bill_email),
+            tech_name,
+            bill_name,
             "Unknown customer"
         )
 
-        # LICENSE / ENTITLEMENT NUMBER
-        license_id = first(
-            lic.get("appEntitlementNumber"),
-            lic.get("hostEntitlementNumber"),
-            lic.get("appEntitlementId"),
-            lic.get("hostEntitlementId"),
-            lic.get("licenseId"),
-            "N/A"
-        )
+        contact_name  = first(tech_name, bill_name)
+        contact_email = first(tech_email, bill_email)
 
-        end_date = first(
-            lic.get("evaluationEndDate"),
-            lic.get("maintenanceEndDate"),
-            g(lic, "license.maintenanceEndDate"),
-            "N/A"
-        )
-
-        hosting = first(lic.get("hosting"), g(lic, "license.hosting"), "N/A")
-        hosting = str(hosting).upper().replace("_", " ")
-
-        plan = first(lic.get("tier"), lic.get("licenseType"), g(lic, "license.edition"), "")
+        license_type = (lic.get("licenseType") or "").upper() or (lic.get("tier") or "").upper() or "EVALUATION"
+        users = users_from_tier(lic.get("tier"))
 
         wanted.append({
             "app": app_name,
             "customer": customer,
-            "licenseId": license_id,
-            "end": end_date,
-            "hosting": hosting,
-            "plan": plan
+            "contactName": contact_name,
+            "contactEmail": contact_email,
+            "licenseType": license_type,
+            "users": users,
         })
     return wanted
-
 
 def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     if not items:
         print("No new trials for window:", start, "→", end)
         return
 
-    date_label = start.isoformat() if start == end else f"{start.isoformat()}–{end.isoformat()}"
-    lines = []
+    # Group by app so each header shows the app once
+    by_app = {}
     for e in items:
-        suffix = f", {e['plan']}" if e['plan'] else ""
-        lines.append(
-            f"• *{e['app']}* — {e['customer']} "
-            f"(ID `{e['licenseId']}`) · {e['hosting']}{suffix} · ends {e['end']}"
-        )
+        by_app.setdefault(e["app"], []).append(e)
 
-    text = f":tada: *New Marketplace trial(s)* ({date_label}, UTC)\n" + "\n".join(lines)
+    date_label = start.isoformat() if start == end else f"{start.isoformat()}–{end.isoformat()}"
+
+    blocks = []
+    for app, rows in by_app.items():
+        header = f":tada: *New trials for {app}* ({date_label}, UTC)"
+        lines = []
+        for e in rows:
+            # contact part
+            if e.get("contactName") and e.get("contactEmail"):
+                contact = f"{e['contactName']} ({e['contactEmail']})"
+            else:
+                contact = e.get("contactName") or e.get("contactEmail") or "—"
+
+            user_part = f" · {e['users']} users" if e.get("users") else ""
+            lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{user_part}")
+
+        blocks.append(header + "\n" + "\n".join(lines))
+
+    text = "\n\n".join(blocks)
     r = requests.post(webhook, json={"text": text}, timeout=30)
     r.raise_for_status()
-    print(f"Posted {len(items)} item(s) to Slack.")
+    print(f"Posted {sum(len(v) for v in by_app.values())} item(s) to Slack.")
 
 def main():
     items = fetch_licenses(VENDOR_ID, start_date, end_date)
