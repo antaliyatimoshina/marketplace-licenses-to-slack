@@ -48,6 +48,7 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
         "dateType": "start",
+        "withDataInsights": "true"
     }
     auth = (MP_USER, MP_API_TOKEN)
     headers = {"Accept": "application/json"}
@@ -97,21 +98,15 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     return out
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
-    """Filter to evaluations that started within [date_from, date_to]."""
+    """
+    Keep only evaluation licenses. The API window (dateType=start) already
+    filtered by the start date, so we don't second-guess it here.
+    """
     wanted = []
     for lic in items:
-        # Normalize fields safely
-        eval_flag = lic.get("evaluationLicense") or lic.get("isEvaluation") or False
+        # Treat as evaluation if the explicit flag is true OR the eval date exists.
+        eval_flag = bool(lic.get("evaluationLicense")) or ("evaluationStartDate" in lic)
         if not eval_flag:
-            continue
-
-        # Dates are ISO strings (UTC); some payloads use evaluationStartDate
-        start = lic.get("evaluationStartDate") or lic.get("startDate")
-        if not isinstance(start, str):
-            continue
-        # Keep only those that start within the window (string startswith is fine for YYYY-MM-DD)
-        if not (start.startswith(date_from.isoformat()) or
-                (date_from != date_to and date_from.isoformat() <= start[:10] <= date_to.isoformat())):
             continue
 
         app_name = (
@@ -120,15 +115,16 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
             or lic.get("addonName")
             or "Unknown app"
         )
-        if APPS_FILTER and app_name not in APPS_FILTER:
-            continue
-
         customer = (
             (lic.get("customer") or {}).get("name")
             or lic.get("customerName")
             or "Unknown customer"
         )
-        license_id = lic.get("licenseId") or (lic.get("license") or {}).get("licenseId") or "N/A"
+        license_id = (
+            lic.get("licenseId")
+            or (lic.get("license") or {}).get("licenseId")
+            or "N/A"
+        )
         end_date = lic.get("evaluationEndDate") or lic.get("endDate") or "N/A"
         hosting  = lic.get("hosting") or (lic.get("deployment") or "").upper() or "N/A"
         plan     = lic.get("edition") or lic.get("plan") or ""
