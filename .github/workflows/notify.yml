@@ -24,5 +24,5 @@ jobs:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           # Optional filters:
           # APPS: "Mria CRM: CRM for Jira Teams"   # only this app
-          # LOOKBACK_DAYS: "7"                     # scan yesterday+today
+          LOOKBACK_DAYS: "7"                     # scan yesterday+today
         run: python src/notify_licenses.py
