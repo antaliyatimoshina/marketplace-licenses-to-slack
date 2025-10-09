@@ -27,10 +27,10 @@ MP_USER       = env("MP_USER", required=True)
 MP_API_TOKEN  = env("MP_API_TOKEN", required=True)
 VENDOR_ID     = env("VENDOR_ID", required=True)
 SLACK_WEBHOOK = env("SLACK_WEBHOOK", required=True)
+DRY_RUN       = env("DRY_RUN") == "1"
 
 APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.strip()])
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "0"))
-STATE_FILE = os.getenv("STATE_FILE", ".state/seen.json")
 
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
@@ -200,7 +200,7 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 
     blocks = []
     for app, rows in by_app.items():
-        header = f":tada: *New Marketplace licenses for {app}* ({date_label}, UTC)"
+        header = f":airplane: *New Marketplace licenses for {app}* ({date_label}, UTC)"
         lines = []
         for e in rows:
             if e.get("contactName") and e.get("contactEmail"):
@@ -212,6 +212,9 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
         blocks.append(header + "\n" + "\n".join(lines))
 
     text = "\n\n".join(blocks)
+    if DRY_RUN:
+        print("DRY_RUN=1 → would post:\n" + "\n".join(lines if isinstance(lines, list) else [text]))
+    return
     r = requests.post(webhook, json={"text": text}, timeout=30)
     r.raise_for_status()
     print(f"Posted {sum(len(v) for v in by_app.values())} item(s) to Slack.")
