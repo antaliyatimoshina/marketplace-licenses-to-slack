@@ -34,8 +34,17 @@ STATE_FILE = os.getenv("STATE_FILE", ".state/seen.json")
 
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
-start_date = today_utc - dt.timedelta(days=LOOKBACK_DAYS)
-end_date   = today_utc  # inclusive day; API uses start/end as dates
+
+# Run once/day and post *yesterday* only (single-day window)
+# This avoids re-posts and eventual-consistency hiccups.
+if os.getenv("MODE_YESTERDAY", "1") == "1":
+    start_date = today_utc - dt.timedelta(days=1)
+    end_date = start_date
+else:
+    # fallback to original behavior if you ever need it
+    LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "0"))
+    start_date = today_utc - dt.timedelta(days=LOOKBACK_DAYS)
+    end_date = today_utc
 
 def load_seen(path: str) -> set[str]:
     try:
