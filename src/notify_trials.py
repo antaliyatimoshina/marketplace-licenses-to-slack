@@ -37,48 +37,53 @@ start_date = today_utc - dt.timedelta(days=LOOKBACK_DAYS)
 end_date   = today_utc  # inclusive day; API uses start/end as dates
 
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
-    """Pull licenses for date window. Returns list of dicts."""
-    url = f"https://marketplace.atlassian.com/rest/2/vendors/{vendor_id}/reporting/licenses"
+    """
+    Fetch licenses from the Marketplace Reporting API for a UTC date window.
+    Note: Atlassian expects 'Accept: application/json'; without it the API may return 404.
+    We also set dateType=evaluationStartDate to look specifically for new trials.
+    """
+    base = "https://marketplace.atlassian.com"
+    url = f"{base}/rest/2/vendors/{vendor_id}/reporting/licenses"
     params = {
         "startDate": start.isoformat(),
-        "endDate": end.isoformat()
+        "endDate": end.isoformat(),
+        "dateType": "evaluationStartDate",
     }
     auth = (MP_USER, MP_API_TOKEN)
+    headers = {"Accept": "application/json"}
 
-    # The API may paginate; handle 'next' if present
     out = []
     while True:
-        r = requests.get(url, params=params, auth=auth, timeout=60)
+        r = requests.get(url, params=params, auth=auth, headers=headers, timeout=60)
         r.raise_for_status()
         data = r.json()
 
-        # Different accounts sometimes return top-level or nested "licenses"
+        # Licenses may be top-level or nested under "licenses"
         items = data.get("licenses", data)
         if isinstance(items, dict) and "licenses" in items:
             items = items["licenses"]
-
         if not isinstance(items, list):
             items = []
 
         out.extend(items)
 
-        next_link = None
-        # Safely find link headers in body if exposed that way
-        for k in ("_links", "links", "page", "paging"):
-            if isinstance(data.get(k), dict):
-                next_link = data[k].get("next") or data[k].get("nextPage")
-                if next_link:
-                    break
+        # Pagination: try Link header first, then body fields
+        next_url = r.links.get("next", {}).get("url")
+        if not next_url:
+            for k in ("_links", "links", "page", "paging"):
+                v = data.get(k)
+                if isinstance(v, dict):
+                    next_url = v.get("next") or v.get("nextPage")
+                    if next_url:
+                        break
 
-        if not next_link:
+        if not next_url:
             break
-        # Absolute or relative next link
-        if next_link.startswith("http"):
-            url = next_link
-            params = {}
-        else:
-            url = f"https://marketplace.atlassian.com{next_link}"
-            params = {}
+
+        # Prepare next request
+        url = next_url if next_url.startswith("http") else f"{base}{next_url}"
+        params = {}  # next URLs already contain query params
+
     return out
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
