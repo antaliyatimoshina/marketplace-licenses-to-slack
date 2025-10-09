@@ -224,21 +224,13 @@ def main():
     rows = pick_new_evaluations(items, start_date, end_date)  # rows have 'licenseId'
     print(f"Fetched {len(items)} raw items; mapped {len(rows)} rows; "
       f"example id: {rows[0].get('licenseId') if rows else '—'}")
-
-    # Load/set seen IDs; skip rows we've already announced
-    seen = load_seen(STATE_FILE)
-
+    
     new_rows = [r for r in rows if r.get("licenseId") and r["licenseId"] not in seen]
     if not new_rows:
         print("No new licenses to post (all already seen).")
         return
 
     post_to_slack(SLACK_WEBHOOK, new_rows, start_date, end_date)
-
-    # Update state
-    for r in new_rows:
-        seen.add(r["licenseId"])
-    save_seen(STATE_FILE, seen)
 
 if __name__ == "__main__":
     main()
