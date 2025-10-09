@@ -27,15 +27,3 @@ jobs:
           # APPS: "Mria CRM: CRM for Jira Teams"   # only this app
           LOOKBACK_DAYS: "7"                     # scan yesterday+today
         run: python src/notify_licenses.py
-      - name: Commit state (if changed)
-        run: |
-          if [ -n "$(git status --porcelain .state/seen.json || true)" ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add .state/seen.json
-            git commit -m "chore(state): update seen licenses [skip ci]"
-            git push
-          else
-            echo "No state changes to commit."
-          fi
-
