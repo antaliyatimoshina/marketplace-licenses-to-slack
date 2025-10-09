@@ -84,78 +84,86 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
-    Keep only evaluation licenses and extract fields robustly.
-    We do NOT re-filter by date here (dateType=start already did it).
+    Keep only evaluation licenses and extract fields based on export payload.
+    We do NOT re-filter by date (dateType=start already did it).
     """
 
-    def pick_first(d, *paths):
-        # paths like "a.b.c" or just "a"; if a path points to a string field directly,
-        # return it; nested dicts are traversed.
-        for path in paths:
-            keys = path.split(".")
-            cur = d
-            ok = True
-            for k in keys:
-                if isinstance(cur, dict) and k in cur:
-                    cur = cur[k]
-                else:
-                    ok = False
-                    break
-            if ok and cur not in (None, "", []):
-                return cur
+    def g(d, path):
+        cur = d
+        for k in path.split("."):
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                return None
+        return cur
+
+    def first(*vals):
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if v not in (None, "", [], {}):
+                return v
+        return None
+
+    def email_domain(email: str | None):
+        if isinstance(email, str) and "@" in email:
+            return email.split("@", 1)[1]
         return None
 
     wanted = []
     for lic in items:
-        # evaluation if explicit flag OR eval date present
-        is_eval = bool(lic.get("evaluationLicense")) or ("evaluationStartDate" in lic)
+        # Treat as evaluation if licenseType/tier says so or eval markers exist
+        is_eval = (
+            (lic.get("licenseType") == "EVALUATION") or
+            (lic.get("tier") == "Evaluation") or
+            ("latestEvaluationStartDate" in lic) or
+            ("evaluationStartDate" in lic) or
+            bool(lic.get("evaluationLicense"))
+        )
         if not is_eval:
             continue
 
-        app_name = (
-            pick_first(lic, "appName", "app.name", "addonName")
-            or "Unknown app"
+        app_name = first(lic.get("addonName"), g(lic, "app.name"), lic.get("appName"), "Unknown app")
+
+        # CUSTOMER: prefer company; then contact names; then site hostname; then email domain
+        company = g(lic, "contactDetails.company")
+        tech_name = g(lic, "contactDetails.technicalContact.name")
+        bill_name = g(lic, "contactDetails.billingContact.name")
+        site = lic.get("cloudSiteHostname")
+        tech_email = g(lic, "contactDetails.technicalContact.email")
+        bill_email = g(lic, "contactDetails.billingContact.email")
+
+        customer = first(
+            company,
+            tech_name,
+            bill_name,
+            site,
+            email_domain(tech_email),
+            email_domain(bill_email),
+            "Unknown customer"
         )
 
-        # CUSTOMER — sometimes a nested object, sometimes a plain string
-        customer = (
-            pick_first(
-                lic,
-                "customer.name", "customerName", "customer",  # <— plain string supported
-                "dataInsights.customerName", "insights.customerName",
-                "organization.name", "endUser.name",
-                "purchaser.name", "account.name", "company.name",
-                "license.customer.name"
-            )
-            or pick_first(lic, "customer.id", "account.id", "organization.id")
-            or "Unknown customer"
+        # LICENSE / ENTITLEMENT NUMBER
+        license_id = first(
+            lic.get("appEntitlementNumber"),
+            lic.get("hostEntitlementNumber"),
+            lic.get("appEntitlementId"),
+            lic.get("hostEntitlementId"),
+            lic.get("licenseId"),
+            "N/A"
         )
 
-        # LICENSE/ENTITLEMENT — try many shapes; fallback to any plausible id
-        license_id = (
-            pick_first(
-                lic,
-                "licenseId", "license.licenseId",
-                "entitlementNumber", "license.entitlementNumber",
-                "supportEntitlementNumber", "sen",
-                "entitlement.id", "entitlement.number",
-                "license.supportEntitlementNumber",
-                "id"  # some exports include a top-level id
-            )
-            or "N/A"
+        end_date = first(
+            lic.get("evaluationEndDate"),
+            lic.get("maintenanceEndDate"),
+            g(lic, "license.maintenanceEndDate"),
+            "N/A"
         )
 
-        end_date = (
-            pick_first(lic, "evaluationEndDate", "endDate", "license.maintenanceEndDate")
-            or "N/A"
-        )
-
-        hosting = (
-            pick_first(lic, "hosting", "deployment", "license.hosting") or "N/A"
-        )
+        hosting = first(lic.get("hosting"), g(lic, "license.hosting"), "N/A")
         hosting = str(hosting).upper().replace("_", " ")
 
-        plan = pick_first(lic, "edition", "plan", "license.edition") or ""
+        plan = first(lic.get("tier"), lic.get("licenseType"), g(lic, "license.edition"), "")
 
         wanted.append({
             "app": app_name,
@@ -165,7 +173,6 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
             "hosting": hosting,
             "plan": plan
         })
-
     return wanted
 
 
