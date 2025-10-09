@@ -190,6 +190,8 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 
 def main():
     items = fetch_licenses(VENDOR_ID, start_date, end_date)
+    print("DEBUG sample item keys:", list(items[0].keys()))
+    print("DEBUG sample item:", json.dumps(items[0], indent=2)[:4000])
     new_evals = pick_new_evaluations(items, start_date, end_date)
     post_to_slack(SLACK_WEBHOOK, new_evals, start_date, end_date)
 
