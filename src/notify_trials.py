@@ -89,9 +89,10 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
 
     def pick_first(d, *paths):
-        # paths can be "a.b.c" or ("a","b","c"); returns first non-empty value
+        # paths like "a.b.c" or just "a"; if a path points to a string field directly,
+        # return it; nested dicts are traversed.
         for path in paths:
-            keys = path.split(".") if isinstance(path, str) else path
+            keys = path.split(".")
             cur = d
             ok = True
             for k in keys:
@@ -116,30 +117,32 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
             or "Unknown app"
         )
 
-        # customer names appear under several shapes; try them in order
+        # CUSTOMER — sometimes a nested object, sometimes a plain string
         customer = (
             pick_first(
                 lic,
-                "customer.name", "customerName",
+                "customer.name", "customerName", "customer",  # <— plain string supported
                 "dataInsights.customerName", "insights.customerName",
                 "organization.name", "endUser.name",
                 "purchaser.name", "account.name", "company.name",
                 "license.customer.name"
-            ) or
-            # fall back to an id if we have one
-            pick_first(lic, "customer.id", "account.id", "organization.id") or
-            "Unknown customer"
+            )
+            or pick_first(lic, "customer.id", "account.id", "organization.id")
+            or "Unknown customer"
         )
 
-        # license / entitlement number variants
+        # LICENSE/ENTITLEMENT — try many shapes; fallback to any plausible id
         license_id = (
             pick_first(
                 lic,
                 "licenseId", "license.licenseId",
                 "entitlementNumber", "license.entitlementNumber",
                 "supportEntitlementNumber", "sen",
-                "entitlement.id", "entitlement.number"
-            ) or "N/A"
+                "entitlement.id", "entitlement.number",
+                "license.supportEntitlementNumber",
+                "id"  # some exports include a top-level id
+            )
+            or "N/A"
         )
 
         end_date = (
