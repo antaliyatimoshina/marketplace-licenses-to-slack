@@ -103,9 +103,9 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
-    Collect ANY new licenses (evaluation or commercial) that started in the window.
-    Output fields for Slack rows:
+    Collect ANY new licenses (evaluation or commercial) and extract fields for Slack:
       • {customer} · {contactName} ({contactEmail}) · {LICENSE_TYPE} [· {N users}]
+    Also include a stable 'licenseId' for de-dup (prefers E-… entitlement number).
     """
     import re
 
@@ -133,9 +133,22 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
                 return int(m.group(1))
         return None
 
-    wanted = []
+    def email_domain(email):
+        return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
+
+    def dedup_id(lic: dict) -> str | None:
+        # Prefer the visible entitlement number (E-…)
+        return first(
+            lic.get("appEntitlementNumber"),
+            lic.get("hostEntitlementNumber"),
+            lic.get("appEntitlementId"),
+            lic.get("hostEntitlementId"),
+            # last-resort composite ID (addonKey + cloudId)
+            f"{lic.get('addonKey')}::{lic.get('cloudId')}" if lic.get("addonKey") and lic.get("cloudId") else None,
+        )
+
+    rows = []
     for lic in items:
-        # We include everything: trials and paid. (dateType=start already filtered by start date.)
         app_name = first(lic.get("addonName"), g(lic, "app.name"), lic.get("appName"), "Unknown app")
 
         company     = g(lic, "contactDetails.company")
@@ -145,36 +158,25 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         tech_email  = g(lic, "contactDetails.technicalContact.email")
         bill_email  = g(lic, "contactDetails.billingContact.email")
 
-        def email_domain(email):
-            return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
-
-        customer = first(
-            company,
-            site,
-            email_domain(tech_email),
-            email_domain(bill_email),
-            tech_name,
-            bill_name,
-            "Unknown customer"
-        )
-
+        customer = first(company, site, email_domain(tech_email), email_domain(bill_email), tech_name, bill_name, "Unknown customer")
         contact_name  = first(tech_name, bill_name)
         contact_email = first(tech_email, bill_email)
 
-        # License type label (e.g., EVALUATION, COMMERCIAL, SUBSCRIPTION), with fallback to tier
         license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
-
         users = users_from_tier(lic.get("tier"))
 
-        wanted.append({
+        lid = dedup_id(lic)
+
+        rows.append({
             "app": app_name,
             "customer": customer,
             "contactName": contact_name,
             "contactEmail": contact_email,
             "licenseType": license_type,
             "users": users,
+            "licenseId": lid,   # <-- critical for de-dup
         })
-    return wanted
+    return rows
 
 def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     if not items:
@@ -208,6 +210,8 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 def main():
     items = fetch_licenses(VENDOR_ID, start_date, end_date)
     rows = pick_new_evaluations(items, start_date, end_date)  # rows have 'licenseId'
+    print(f"Fetched {len(items)} raw items; mapped {len(rows)} rows; "
+      f"example id: {rows[0].get('licenseId') if rows else '—'}")
 
     # Load/set seen IDs; skip rows we've already announced
     seen = load_seen(STATE_FILE)
