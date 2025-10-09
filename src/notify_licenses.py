@@ -84,10 +84,9 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
-    Keep only evaluation licenses (or those with eval markers) and extract fields
-    for the new Slack format:
+    Collect ANY new licenses (evaluation or commercial) that started in the window.
+    Output fields for Slack rows:
       • {customer} · {contactName} ({contactEmail}) · {LICENSE_TYPE} [· {N users}]
-    We do NOT re-filter by date here (dateType=start already did).
     """
     import re
 
@@ -117,19 +116,9 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
 
     wanted = []
     for lic in items:
-        is_eval = (
-            (lic.get("licenseType") == "EVALUATION") or
-            (lic.get("tier") == "Evaluation") or
-            ("latestEvaluationStartDate" in lic) or
-            ("evaluationStartDate" in lic) or
-            bool(lic.get("evaluationLicense"))
-        )
-        if not is_eval:
-            continue
-
+        # We include everything: trials and paid. (dateType=start already filtered by start date.)
         app_name = first(lic.get("addonName"), g(lic, "app.name"), lic.get("appName"), "Unknown app")
 
-        # Customer: prefer company, then site hostname, then contact name/email domain
         company     = g(lic, "contactDetails.company")
         site        = lic.get("cloudSiteHostname")
         tech_name   = g(lic, "contactDetails.technicalContact.name")
@@ -153,7 +142,9 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         contact_name  = first(tech_name, bill_name)
         contact_email = first(tech_email, bill_email)
 
-        license_type = (lic.get("licenseType") or "").upper() or (lic.get("tier") or "").upper() or "EVALUATION"
+        # License type label (e.g., EVALUATION, COMMERCIAL, SUBSCRIPTION), with fallback to tier
+        license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
+
         users = users_from_tier(lic.get("tier"))
 
         wanted.append({
@@ -168,10 +159,9 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
 
 def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     if not items:
-        print("No new trials for window:", start, "→", end)
+        print("No new licenses for window:", start, "→", end)
         return
 
-    # Group by app so each header shows the app once
     by_app = {}
     for e in items:
         by_app.setdefault(e["app"], []).append(e)
@@ -180,18 +170,15 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 
     blocks = []
     for app, rows in by_app.items():
-        header = f":tada: *New trials for {app}* ({date_label}, UTC)"
+        header = f":tada: *New Marketplace licenses for {app}* ({date_label}, UTC)"
         lines = []
         for e in rows:
-            # contact part
             if e.get("contactName") and e.get("contactEmail"):
                 contact = f"{e['contactName']} ({e['contactEmail']})"
             else:
                 contact = e.get("contactName") or e.get("contactEmail") or "—"
-
             user_part = f" · {e['users']} users" if e.get("users") else ""
             lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{user_part}")
-
         blocks.append(header + "\n" + "\n".join(lines))
 
     text = "\n\n".join(blocks)
@@ -201,8 +188,6 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 
 def main():
     items = fetch_licenses(VENDOR_ID, start_date, end_date)
-    print("DEBUG sample item keys:", list(items[0].keys()))
-    print("DEBUG sample item:", json.dumps(items[0], indent=2)[:4000])
     new_evals = pick_new_evaluations(items, start_date, end_date)
     post_to_slack(SLACK_WEBHOOK, new_evals, start_date, end_date)
 
