@@ -38,9 +38,9 @@ end_date   = today_utc  # inclusive day; API uses start/end as dates
 
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     """
-    Fetch licenses for a UTC date window. We filter by the license *start* date,
-    which for evaluations aligns with evaluationStartDate. The API expects
-    Accept: application/json, otherwise it may 404.
+    Fetch licenses for a UTC date window from Atlassian Marketplace Reporting API.
+    Uses dateType=start (license start date). Adds Accept header and handles
+    pagination where 'next' may be a string, or a dict with href/url.
     """
     base = "https://marketplace.atlassian.com"
     url = f"{base}/rest/2/vendors/{vendor_id}/reporting/licenses"
@@ -52,12 +52,20 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     auth = (MP_USER, MP_API_TOKEN)
     headers = {"Accept": "application/json"}
 
+    def _normalize_next(obj):
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, dict):
+            return obj.get("url") or obj.get("href")
+        return None
+
     out = []
     while True:
         r = requests.get(url, params=params, auth=auth, headers=headers, timeout=60)
         r.raise_for_status()
         data = r.json()
 
+        # Items may be top-level or nested under "licenses"
         items = data.get("licenses", data)
         if isinstance(items, dict) and "licenses" in items:
             items = items["licenses"]
@@ -65,20 +73,26 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
             items = []
         out.extend(items)
 
-        # pagination: Link header first, then body hints
-        next_url = r.links.get("next", {}).get("url")
-        if not next_url:
+        # Find 'next' (1) Link header, (2) body fields
+        next_url = None
+        if isinstance(r.links.get("next"), dict):
+            next_url = _normalize_next(r.links["next"])
+        if not next_url and isinstance(data, dict):
             for k in ("_links", "links", "page", "paging"):
                 v = data.get(k)
                 if isinstance(v, dict):
-                    next_url = v.get("next") or v.get("nextPage")
+                    next_url = _normalize_next(v.get("next") or v.get("nextPage"))
                     if next_url:
                         break
+
         if not next_url:
             break
 
-        url = next_url if next_url.startswith("http") else f"{base}{next_url}"
-        params = {}  # next contains its own query
+        if not next_url.startswith("http"):
+            next_url = f"{base}{next_url}"
+
+        # Next page URL already contains its own query; clear params
+        url, params = next_url, {}
 
     return out
 
