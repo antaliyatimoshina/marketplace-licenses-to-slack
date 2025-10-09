@@ -203,11 +203,13 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 
 def main():
     items = fetch_licenses(VENDOR_ID, start_date, end_date)
-    rows = pick_new_evaluations(items, start_date, end_date)  # rows have 'licenseId'
+    rows = pick_new_evaluations(items, start_date, end_date)
+
     print(f"Fetched {len(items)} raw items; mapped {len(rows)} rows; "
-      f"example id: {rows[0].get('licenseId') if rows else '—'}")
+          f"example id: {rows[0].get('licenseId') if rows else '—'}")
 
-    post_to_slack(SLACK_WEBHOOK, new_rows, start_date, end_date)
+    if not rows:
+        print(f"No new licenses for window: {start_date} → {end_date}")
+        return
 
-if __name__ == "__main__":
-    main()
+    post_to_slack(SLACK_WEBHOOK, rows, start_date, end_date)
