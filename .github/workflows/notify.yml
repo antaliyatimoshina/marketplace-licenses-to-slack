@@ -1,4 +1,4 @@
-name: Marketplace trials → Slack
+name: Marketplace licenses → Slack
 
 on:
   schedule:
@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Notify Slack about new trials
+      - name: Notify Slack about new licenses
         env:
           MP_USER: ${{ secrets.MP_USER }}
           MP_API_TOKEN: ${{ secrets.MP_API_TOKEN }}
@@ -25,4 +25,4 @@ jobs:
           # Optional filters:
           # APPS: "Mria CRM: CRM for Jira Teams"   # only this app
           LOOKBACK_DAYS: "7"                     # scan yesterday+today
-        run: python src/notify_trials.py
+        run: python src/notify_licenses.py
