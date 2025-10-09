@@ -1,0 +1,28 @@
+name: Marketplace trials → Slack
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+  workflow_dispatch:          # allow manual runs
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Notify Slack about new trials
+        env:
+          MP_USER: ${{ secrets.MP_USER }}
+          MP_API_TOKEN: ${{ secrets.MP_API_TOKEN }}
+          VENDOR_ID: ${{ secrets.VENDOR_ID }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          # Optional filters:
+          # APPS: "Mria CRM: CRM for Jira Teams"   # only this app
+          # LOOKBACK_DAYS: "1"                     # scan yesterday+today
+        run: python src/notify_trials.py
