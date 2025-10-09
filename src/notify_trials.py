@@ -99,35 +99,75 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
-    Keep only evaluation licenses. The API window (dateType=start) already
-    filtered by the start date, so we don't second-guess it here.
+    Keep only evaluation licenses and extract fields robustly.
+    We do NOT re-filter by date here (dateType=start already did it).
     """
+
+    def pick_first(d, *paths):
+        # paths can be "a.b.c" or ("a","b","c"); returns first non-empty value
+        for path in paths:
+            keys = path.split(".") if isinstance(path, str) else path
+            cur = d
+            ok = True
+            for k in keys:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    ok = False
+                    break
+            if ok and cur not in (None, "", []):
+                return cur
+        return None
+
     wanted = []
     for lic in items:
-        # Treat as evaluation if the explicit flag is true OR the eval date exists.
-        eval_flag = bool(lic.get("evaluationLicense")) or ("evaluationStartDate" in lic)
-        if not eval_flag:
+        # evaluation if explicit flag OR eval date present
+        is_eval = bool(lic.get("evaluationLicense")) or ("evaluationStartDate" in lic)
+        if not is_eval:
             continue
 
         app_name = (
-            lic.get("appName")
-            or (lic.get("app") or {}).get("name")
-            or lic.get("addonName")
+            pick_first(lic, "appName", "app.name", "addonName")
             or "Unknown app"
         )
+
+        # customer names appear under several shapes; try them in order
         customer = (
-            (lic.get("customer") or {}).get("name")
-            or lic.get("customerName")
-            or "Unknown customer"
+            pick_first(
+                lic,
+                "customer.name", "customerName",
+                "dataInsights.customerName", "insights.customerName",
+                "organization.name", "endUser.name",
+                "purchaser.name", "account.name", "company.name",
+                "license.customer.name"
+            ) or
+            # fall back to an id if we have one
+            pick_first(lic, "customer.id", "account.id", "organization.id") or
+            "Unknown customer"
         )
+
+        # license / entitlement number variants
         license_id = (
-            lic.get("licenseId")
-            or (lic.get("license") or {}).get("licenseId")
+            pick_first(
+                lic,
+                "licenseId", "license.licenseId",
+                "entitlementNumber", "license.entitlementNumber",
+                "supportEntitlementNumber", "sen",
+                "entitlement.id", "entitlement.number"
+            ) or "N/A"
+        )
+
+        end_date = (
+            pick_first(lic, "evaluationEndDate", "endDate", "license.maintenanceEndDate")
             or "N/A"
         )
-        end_date = lic.get("evaluationEndDate") or lic.get("endDate") or "N/A"
-        hosting  = lic.get("hosting") or (lic.get("deployment") or "").upper() or "N/A"
-        plan     = lic.get("edition") or lic.get("plan") or ""
+
+        hosting = (
+            pick_first(lic, "hosting", "deployment", "license.hosting") or "N/A"
+        )
+        hosting = str(hosting).upper().replace("_", " ")
+
+        plan = pick_first(lic, "edition", "plan", "license.edition") or ""
 
         wanted.append({
             "app": app_name,
@@ -137,7 +177,9 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
             "hosting": hosting,
             "plan": plan
         })
+
     return wanted
+
 
 def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     if not items:
