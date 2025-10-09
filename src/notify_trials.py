@@ -38,16 +38,16 @@ end_date   = today_utc  # inclusive day; API uses start/end as dates
 
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     """
-    Fetch licenses from the Marketplace Reporting API for a UTC date window.
-    Note: Atlassian expects 'Accept: application/json'; without it the API may return 404.
-    We also set dateType=evaluationStartDate to look specifically for new trials.
+    Fetch licenses for a UTC date window. We filter by the license *start* date,
+    which for evaluations aligns with evaluationStartDate. The API expects
+    Accept: application/json, otherwise it may 404.
     """
     base = "https://marketplace.atlassian.com"
     url = f"{base}/rest/2/vendors/{vendor_id}/reporting/licenses"
     params = {
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
-        "dateType": "evaluationStartDate",
+        "dateType": "start",
     }
     auth = (MP_USER, MP_API_TOKEN)
     headers = {"Accept": "application/json"}
@@ -58,16 +58,14 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
         r.raise_for_status()
         data = r.json()
 
-        # Licenses may be top-level or nested under "licenses"
         items = data.get("licenses", data)
         if isinstance(items, dict) and "licenses" in items:
             items = items["licenses"]
         if not isinstance(items, list):
             items = []
-
         out.extend(items)
 
-        # Pagination: try Link header first, then body fields
+        # pagination: Link header first, then body hints
         next_url = r.links.get("next", {}).get("url")
         if not next_url:
             for k in ("_links", "links", "page", "paging"):
@@ -76,13 +74,11 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
                     next_url = v.get("next") or v.get("nextPage")
                     if next_url:
                         break
-
         if not next_url:
             break
 
-        # Prepare next request
         url = next_url if next_url.startswith("http") else f"{base}{next_url}"
-        params = {}  # next URLs already contain query params
+        params = {}  # next contains its own query
 
     return out
 
