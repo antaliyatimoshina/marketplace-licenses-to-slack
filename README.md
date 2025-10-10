@@ -29,7 +29,11 @@ Polls the Atlassian Marketplace Reporting API once per day for new licenses (tri
 ## What it does
 
 - Calls: `GET /rest/2/vendors/{vendorId}/reporting/licenses/export?accept=json&dateType=start&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD` (new licenses: trials + paid)
-- Calls: `GET /rest/2/vendors/{vendorId}/reporting/feedback/details/export?accept=json&type=uninstall&type=unsubscribe&type=disable&startDate=YYYY-MM-DD&endDate=YYY
+- Calls: `GET /rest/2/vendors/{vendorId}/reporting/feedback/details/export?accept=json&type=uninstall&type=unsubscribe&type=disable&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD` (uninstalls/churn)
+- Parses company/contact, license type, and (when present) user count from the `tier`
+- Posts **one Slack message per day**, grouped by app: **New licenses** first, then **Uninstalls / Unsubscribes**
+- Uses a **single UTC day** (yesterday by default); set `DAY=YYYY-MM-DD` to backfill a specific date
+- No state stored; runs on GitHub Actions and posts via Slack Incoming Webhook
 
 ## Notes
 
