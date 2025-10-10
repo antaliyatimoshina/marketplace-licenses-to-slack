@@ -209,11 +209,16 @@ def fetch_uninstalls(vendor_id: str, start: dt.date, end: dt.date):
         return data.get("feedback", []) or data.get("items", []) or []
     return []
 
-def pick_uninstalls(items):
+def pick_uninstalls(items, name_map=None):
     """
-    Map feedback items to rows for Slack lines:
-      • {customerOrSite} · {contactName} ({email}) · {TYPE}
+    Map feedback items (uninstall/unsubscribe/disable) to rows for Slack:
+      • {customer/site} · {contactName} ({email}) · {TYPE}
+    Includes:
+      - app     : pretty name (uses addonName, then name_map[addonKey], then addonKey)
+      - appKey  : canonical key for grouping with license rows
     """
+    import uuid
+
     def first(*vals):
         for v in vals:
             if isinstance(v, str) and v.strip():
@@ -222,27 +227,40 @@ def pick_uninstalls(items):
                 return v
         return None
 
+    def is_uuid(s):
+        try:
+            uuid.UUID(str(s))
+            return True
+        except Exception:
+            return False
+
     rows = []
-    for f in items:
-        app = first(f.get("addonName"), f.get("addonKey"), "Unknown app")
+    for f in (items or []):
+        # compute key & pretty name safely
+        key = first(f.get("addonKey"), (f.get("app") or {}).get("key"))
+        app_name = first(f.get("addonName"), (name_map or {}).get(key), key, "Unknown app")
+        app_key_expr = key or app_name  # canonical key for grouping
+
         ftype = (f.get("feedbackType") or "").upper()  # UNINSTALL / UNSUBSCRIBE / DISABLE
         email = f.get("email")
-        name = f.get("fullName")
-        site = first(f.get("cloudSiteHostname"), f.get("cloudId"))
-        cust = first(
-            site,
-            (email.split("@",1)[1] if isinstance(email, str) and "@" in email else None),
-            "Unknown"
-        )
+        name  = f.get("fullName")
+
+        # Prefer site hostname; avoid raw UUID cloudId
+        site = first(f.get("cloudSiteHostname"), (None if is_uuid(f.get("cloudId")) else f.get("cloudId")))
+        # Fallback to email domain if no hostname
+        if not site and isinstance(email, str) and "@" in email:
+            site = email.split("@", 1)[1]
+
+        customer = first(site, "Unknown")
 
         rows.append({
-            "app": app,
-            "appKey": app_key,
-            "customer": cust,
+            "app": app_name,
+            "appKey": app_key_expr,    # <-- defined here
+            "customer": customer,
             "contactName": name,
             "contactEmail": email,
-            "licenseType": ftype,  # we’ll print this as the action label
-            "users": None,         # not present in feedback
+            "licenseType": ftype,
+            "users": None,
         })
     return rows
 
