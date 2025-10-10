@@ -267,49 +267,76 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     print(f"Posted {sum(len(v) for v in by_app.values())} item(s) to Slack.")
 
 def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date):
+    """
+    One message per app:
+    {App} Marketplace Events (YYYY-MM-DD, UTC)
+
+    ✈️ New licenses
+    • customer · Name (email) · TYPE [· N users]
+
+    ➖ Uninstalls / Unsubscribes
+    • customer/site · Name (email) · TYPE
+    """
     if not licenses_rows and not uninstall_rows:
-        print("Nothing to post (no new licenses or uninstalls).")
+        requests.post(webhook, json={"text": f"ℹ️ No new licenses or uninstalls for {start.isoformat()} (UTC)."})
+        print("Nothing to post.")
         return
 
-    date_label = start.isoformat()  # single-day summary
+    # group rows by app
     by_app_lic = {}
-    for e in licenses_rows:
-        by_app_lic.setdefault(e["app"], []).append(e)
-    by_app_un  = {}
-    for e in uninstall_rows:
-        by_app_un.setdefault(e["app"], []).append(e)
+    for r in licenses_rows or []:
+        by_app_lic.setdefault(r["app"], []).append(r)
 
+    by_app_un = {}
+    for r in uninstall_rows or []:
+        by_app_un.setdefault(r["app"], []).append(r)
+
+    date_label = start.isoformat()  # single-day summary
     parts = []
-    # Licenses section (first)
-    for app, rows in by_app_lic.items():
-        header = f":tada: *New Marketplace licenses for {app}* ({date_label}, UTC)"
-        lines = []
-        for e in rows:
-            if e.get("contactName") and e.get("contactEmail"):
-                contact = f"{e['contactName']} ({e['contactEmail']})"
-            else:
-                contact = e.get("contactName") or e.get("contactEmail") or "—"
-            user_part = f" · {e['users']} users" if e.get("users") else ""
-            lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{user_part}")
-        parts.append(header + "\n" + "\n".join(lines))
 
-    # Uninstalls section (second)
-    for app, rows in by_app_un.items():
-        header = f":no_entry: *Uninstalls / Unsubscribes for {app}* ({date_label}, UTC)"
-        lines = []
-        for e in rows:
-            if e.get("contactName") and e.get("contactEmail"):
-                contact = f"{e['contactName']} ({e['contactEmail']})"
-            else:
-                contact = e.get("contactName") or e.get("contactEmail") or "—"
-            lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}")
-        parts.append(header + "\n" + "\n".join(lines))
+    # union of all apps present in either section
+    apps = sorted(set(list(by_app_lic.keys()) + list(by_app_un.keys())))
+
+    for app in apps:
+        lic_rows = by_app_lic.get(app, [])
+        un_rows  = by_app_un.get(app, [])
+
+        header = f"{app} Marketplace Events ({date_label}, UTC)"
+        body_sections = []
+
+        if lic_rows:
+            lines = []
+            for e in lic_rows:
+                if e.get("contactName") and e.get("contactEmail"):
+                    contact = f"{e['contactName']} ({e['contactEmail']})"
+                else:
+                    contact = e.get("contactName") or e.get("contactEmail") or "—"
+                users_part = f" · {e['users']} users" if e.get("users") else ""
+                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}")
+            body_sections.append(":airplane: New licenses\n" + "\n".join(lines))
+
+        if un_rows:
+            lines = []
+            for e in un_rows:
+                if e.get("contactName") and e.get("contactEmail"):
+                    contact = f"{e['contactName']} ({e['contactEmail']})"
+                else:
+                    contact = e.get("contactName") or e.get("contactEmail") or "—"
+                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}")
+            body_sections.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
+
+        # If you want to always show both sections even when empty, uncomment:
+        # if not lic_rows:
+        #     body_sections.append(":airplane: New licenses\n• —")
+        # if not un_rows:
+        #     body_sections.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n• —")
+
+        parts.append(header + "\n\n" + "\n\n".join(body_sections))
 
     text = "\n\n".join(parts)
     r = requests.post(webhook, json={"text": text}, timeout=30)
     r.raise_for_status()
-    print(f"Posted combined message: {sum(len(v) for v in by_app_lic.values())} licenses, {sum(len(v) for v in by_app_un.values())} uninstalls.")
-
+    print("Posted combined message (new format).")
 
 def main():
     start_date, end_date = day_window_utc()
