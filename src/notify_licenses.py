@@ -42,6 +42,24 @@ APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.str
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
 
+def _extract_license_id(lic: dict):
+    """Prefer the visible E-… entitlement; fall back to other ids/composite."""
+    def _first(*vals):
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if v not in (None, "", [], {}):
+                return v
+        return None
+    return _first(
+        lic.get("appEntitlementNumber"),
+        lic.get("hostEntitlementNumber"),
+        lic.get("appEntitlementId"),
+        lic.get("hostEntitlementId"),
+        (f"{lic.get('addonKey')}::{lic.get('cloudId')}"
+         if lic.get("addonKey") and lic.get("cloudId") else None),
+    )
+
 def day_window_utc():
     """
     Returns (start_date, end_date) as the same YYYY-MM-DD date in UTC.
@@ -163,6 +181,7 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         contact_email = first(tech.get("email"), bill.get("email"))
 
         # Type & users
+        license_id = _extract_license_id(lic)
         license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
         users = None
         if isinstance(lic.get("tier"), str):
@@ -365,12 +384,13 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
         if g["lic"]:
             lines = []
             for e in g["lic"]:
-                if e.get("contactName") and e.get("contactEmail"):
+                ]if e.get("contactName") and e.get("contactEmail"):
                     contact = f"{e['contactName']} ({e['contactEmail']})"
                 else:
                     contact = e.get("contactName") or e.get("contactEmail") or "—"
                 users_part = f" · {e['users']} users" if e.get("users") else ""
-                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}")
+                id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""  # <— ADD
+                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
             section_lines.append(":airplane: New licenses\n" + "\n".join(lines))
 
         if g["un"]:
