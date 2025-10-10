@@ -99,7 +99,7 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
     Collect ANY new licenses (evaluation or commercial) and extract fields for Slack:
       • {customer} · {contactName} ({contactEmail}) · {LICENSE_TYPE} [· {N users}]
-    Also include a stable 'licenseId' for de-dup/reporting and 'appKey' for grouping.
+    Also include 'licenseId' (for logging) and 'appKey' (to merge with uninstall rows).
     """
     import re
 
@@ -130,21 +130,21 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     def email_domain(email):
         return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
 
-    def dedup_id(lic: dict) -> str | None:
+    def stable_id(lic: dict) -> str | None:
         # Prefer the visible entitlement number (E-…)
         return first(
             lic.get("appEntitlementNumber"),
             lic.get("hostEntitlementNumber"),
             lic.get("appEntitlementId"),
             lic.get("hostEntitlementId"),
-            # last-resort composite ID (addonKey + cloudId)
-            f"{lic.get('addonKey')}::{lic.get('cloudId')}" if lic.get("addonKey") and lic.get("cloudId") else None,
+            (f"{lic.get('addonKey')}::{lic.get('cloudId')}"
+             if lic.get('addonKey') and lic.get('cloudId') else None),
         )
 
     rows = []
-    for lic in items or []:
+    for lic in (items or []):
         app_name = first(lic.get("addonName"), g(lic, "app.name"), lic.get("appName"), "Unknown app")
-        app_key  = first(lic.get("addonKey"), g(lic, "app.key"))  # <-- define app_key
+        app_key  = first(lic.get("addonKey"), g(lic, "app.key"))  # <-- define app_key here
 
         company     = g(lic, "contactDetails.company")
         site        = lic.get("cloudSiteHostname")
@@ -153,17 +153,18 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         tech_email  = g(lic, "contactDetails.technicalContact.email")
         bill_email  = g(lic, "contactDetails.billingContact.email")
 
-        customer = first(company, site, email_domain(tech_email), email_domain(bill_email), tech_name, bill_name, "Unknown customer")
+        customer = first(company, site, email_domain(tech_email), email_domain(bill_email),
+                         tech_name, bill_name, "Unknown customer")
         contact_name  = first(tech_name, bill_name)
         contact_email = first(tech_email, bill_email)
 
         license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
         users = users_from_tier(lic.get("tier"))
-        lid = dedup_id(lic)
+        lid = stable_id(lic)
 
         rows.append({
             "app": app_name,
-            "appKey": app_key,          # <-- used to merge with uninstall rows
+            "appKey": app_key,          # used to merge with uninstall rows
             "customer": customer,
             "contactName": contact_name,
             "contactEmail": contact_email,
