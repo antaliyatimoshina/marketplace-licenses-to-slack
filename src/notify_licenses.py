@@ -221,10 +221,11 @@ def fetch_uninstalls(vendor_id: str, start: dt.date, end: dt.date):
 def pick_uninstalls(items, name_map=None):
     """
     Map feedback items (uninstall/unsubscribe/disable) to rows for Slack:
-      • {customer/site} · {contactName} ({email}) · {TYPE}
+      • {customerOrSiteOrId} · {contactName} ({email}) · {TYPE}
     Includes:
-      - app     : pretty name (uses addonName, then name_map[addonKey], then addonKey)
+      - app     : pretty name (addonName → name_map[addonKey] → addonKey)
       - appKey  : canonical key for grouping with license rows
+      - licenseId: best available entitlement/license id (E-… preferred)
     """
     import uuid
 
@@ -236,43 +237,56 @@ def pick_uninstalls(items, name_map=None):
                 return v
         return None
 
-    def is_uuid(s):
+    def is_uuidlike(s):
         try:
             uuid.UUID(str(s))
             return True
         except Exception:
             return False
 
+    def domain(email):
+        return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
+
     rows = []
     for f in (items or []):
-        # compute key & pretty name safely
         key = first(f.get("addonKey"), (f.get("app") or {}).get("key"))
         app_name = first(f.get("addonName"), (name_map or {}).get(key), key, "Unknown app")
-        app_key_expr = key or app_name  # canonical key for grouping
+        app_key_expr = key or app_name
 
         ftype = (f.get("feedbackType") or "").upper()  # UNINSTALL / UNSUBSCRIBE / DISABLE
         email = f.get("email")
         name  = f.get("fullName")
+        site  = first(f.get("cloudSiteHostname"), (None if is_uuidlike(f.get("cloudId")) else f.get("cloudId")))
 
-        # Prefer site hostname; avoid raw UUID cloudId
-        site = first(f.get("cloudSiteHostname"), (None if is_uuid(f.get("cloudId")) else f.get("cloudId")))
-        # Fallback to email domain if no hostname
-        if not site and isinstance(email, str) and "@" in email:
-            site = email.split("@", 1)[1]
+        # Best visible ID(s)
+        license_id = first(
+            f.get("appEntitlementNumber"),
+            f.get("licenseId"),
+            f.get("hostEntitlementNumber"),
+            f.get("appEntitlementId"),
+            f.get("hostEntitlementId"),
+        )
 
-        customer = first(site, "Unknown")
+        # Customer fallback chain: hostname → email domain → entitlement → short cloudId → Unknown
+        cust = first(
+            site,
+            domain(email),
+            license_id,
+            (str(f.get("cloudId"))[:8] + "…" if f.get("cloudId") else None),
+            "Unknown",
+        )
 
         rows.append({
             "app": app_name,
-            "appKey": app_key_expr,    # <-- defined here
-            "customer": customer,
+            "appKey": app_key_expr,
+            "customer": cust,
             "contactName": name,
             "contactEmail": email,
             "licenseType": ftype,
             "users": None,
+            "licenseId": license_id,
         })
     return rows
-
 
 def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     if not items:
@@ -366,7 +380,9 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                     contact = f"{e['contactName']} ({e['contactEmail']})"
                 else:
                     contact = e.get("contactName") or e.get("contactEmail") or "—"
-                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}")
+                id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""
+                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{id_part}")
+
             section_lines.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
 
         parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_lines))
