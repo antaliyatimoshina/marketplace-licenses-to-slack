@@ -332,3 +332,8 @@ def main():
     un_rows   = pick_uninstalls(un_items)
 
     post_combined_to_slack(SLACK_WEBHOOK, lic_rows, un_rows, start_date, end_date)
+
+    if not lic_rows and not un_rows:
+        requests.post(SLACK_WEBHOOK, json={"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
+    return
+
