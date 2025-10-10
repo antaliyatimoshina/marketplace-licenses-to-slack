@@ -2,7 +2,7 @@ name: Marketplace licenses → Slack
 
 on:
   schedule:
-    - cron: "0 7 * * *"   # 09:00 Kyiv when UTC+2 (winter), 10:00 when UTC+3 (summer)
+    - cron: "30 8 * * *"   # 09:00 Kyiv when UTC+2 (winter), 10:00 when UTC+3 (summer)
   workflow_dispatch:          # allow manual runs
 
 jobs:
