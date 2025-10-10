@@ -98,10 +98,13 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
     Map ANY new licenses (trial/paid) to rows for Slack and include:
-    - app  : pretty name
-    - appKey: canonical key for grouping with uninstall rows
-    - customer · contactName/email · licenseType · users (parsed from tier)
-    - licenseId: best available entitlement id
+      - app      : pretty name
+      - appKey   : canonical key for grouping with uninstall rows
+      - customer : company/site/email-domain fallback
+      - contactName/contactEmail
+      - licenseType : e.g., EVALUATION/COMMERCIAL (uppercased)
+      - users    : parsed from 'tier' when present
+      - licenseId: visible entitlement number if available
     """
     import re
 
@@ -113,29 +116,30 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
                 return v
         return None
 
+    def domain(email):
+        return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
+
     rows = []
     for lic in (items or []):
+        # Names/keys
         app_name = first(
             lic.get("addonName"),
             (lic.get("app") or {}).get("name"),
             lic.get("appName"),
             "Unknown app",
         )
-        # <-- define the key right here; guaranteed to exist (falls back to name)
-        app_key = first(
+        # compute the key inline (no temporary variable)
+        app_key_expr = first(
             lic.get("addonKey"),
             (lic.get("app") or {}).get("key"),
-            app_name,
+            app_name,  # last-resort fallback to keep grouping stable
         )
 
-        # contact/customer
+        # Contact/customer
         cd   = lic.get("contactDetails") or {}
         tech = cd.get("technicalContact") or {}
         bill = cd.get("billingContact") or {}
         site = lic.get("cloudSiteHostname")
-
-        def domain(email):
-            return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
 
         customer = first(
             cd.get("company"),
@@ -149,7 +153,7 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         contact_name  = first(tech.get("name"),  bill.get("name"))
         contact_email = first(tech.get("email"), bill.get("email"))
 
-        # type & users
+        # Type & users
         license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
         users = None
         if isinstance(lic.get("tier"), str):
@@ -157,18 +161,19 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
             if m:
                 users = int(m.group(1))
 
-        # stable-ish id for logs/debug
+        # Best visible ID
         license_id = first(
             lic.get("appEntitlementNumber"),
             lic.get("hostEntitlementNumber"),
             lic.get("appEntitlementId"),
             lic.get("hostEntitlementId"),
-            f"{lic.get('addonKey')}::{lic.get('cloudId')}" if lic.get("addonKey") and lic.get("cloudId") else None,
+            (f"{lic.get('addonKey')}::{lic.get('cloudId')}"
+             if lic.get("addonKey") and lic.get("cloudId") else None),
         )
 
         rows.append({
             "app": app_name,
-            "appKey": app_key,                # <-- now always defined
+            "appKey": app_key_expr,          # <— computed inline; no NameError possible
             "customer": customer,
             "contactName": contact_name,
             "contactEmail": contact_email,
