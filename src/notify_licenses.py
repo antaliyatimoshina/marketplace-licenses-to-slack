@@ -35,6 +35,19 @@ LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "0"))
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
 
+def day_window_utc():
+    """
+    Returns (start_date, end_date) as the same YYYY-MM-DD date in UTC.
+    If env DAY=YYYY-MM-DD is set, uses that date; else defaults to yesterday (UTC).
+    """
+    d = os.getenv("DAY")
+    if d:
+        s = e = dt.date.fromisoformat(d)
+    else:
+        e = dt.datetime.utcnow().date() - dt.timedelta(days=1)
+        s = e
+    return s, e
+
 # Run once/day and post *yesterday* only (single-day window)
 # This avoids re-posts and eventual-consistency hiccups.
 if os.getenv("MODE_YESTERDAY", "1") == "1":
@@ -169,6 +182,68 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         })
     return rows
 
+def fetch_uninstalls(vendor_id: str, start: dt.date, end: dt.date):
+    """
+    Fetch churn feedback (uninstall/unsubscribe/disable) for a UTC date window.
+    Uses Feedback Details EXPORT with accept=json for richer fields.
+    """
+    base = "https://marketplace.atlassian.com"
+    url = f"{base}/rest/2/vendors/{vendor_id}/reporting/feedback/details/export"
+    params = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "accept": "json",
+        # churn actions to include:
+        "type": ["uninstall", "unsubscribe", "disable"],
+    }
+    auth = (MP_USER, MP_API_TOKEN)
+    headers = {"Accept": "application/json"}
+    r = requests.get(url, params=params, auth=auth, headers=headers, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("feedback", []) or data.get("items", []) or []
+    return []
+
+def pick_uninstalls(items):
+    """
+    Map feedback items to rows for Slack lines:
+      • {customerOrSite} · {contactName} ({email}) · {TYPE}
+    """
+    def first(*vals):
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if v not in (None, "", [], {}):
+                return v
+        return None
+
+    rows = []
+    for f in items:
+        app = first(f.get("addonName"), f.get("addonKey"), "Unknown app")
+        ftype = (f.get("feedbackType") or "").upper()  # UNINSTALL / UNSUBSCRIBE / DISABLE
+        email = f.get("email")
+        name = f.get("fullName")
+        site = first(f.get("cloudSiteHostname"), f.get("cloudId"))
+        cust = first(
+            site,
+            (email.split("@",1)[1] if isinstance(email, str) and "@" in email else None),
+            "Unknown"
+        )
+
+        rows.append({
+            "app": app,
+            "customer": cust,
+            "contactName": name,
+            "contactEmail": email,
+            "licenseType": ftype,  # we’ll print this as the action label
+            "users": None,         # not present in feedback
+        })
+    return rows
+
+
 def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     if not items:
         print("No new licenses for window:", start, "→", end)
@@ -201,15 +276,59 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
     r.raise_for_status()
     print(f"Posted {sum(len(v) for v in by_app.values())} item(s) to Slack.")
 
-def main():
-    items = fetch_licenses(VENDOR_ID, start_date, end_date)
-    rows = pick_new_evaluations(items, start_date, end_date)
-
-    print(f"Fetched {len(items)} raw items; mapped {len(rows)} rows; "
-          f"example id: {rows[0].get('licenseId') if rows else '—'}")
-
-    if not rows:
-        print(f"No new licenses for window: {start_date} → {end_date}")
+def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date):
+    if not licenses_rows and not uninstall_rows:
+        print("Nothing to post (no new licenses or uninstalls).")
         return
 
-    post_to_slack(SLACK_WEBHOOK, rows, start_date, end_date)
+    date_label = start.isoformat()  # single-day summary
+    by_app_lic = {}
+    for e in licenses_rows:
+        by_app_lic.setdefault(e["app"], []).append(e)
+    by_app_un  = {}
+    for e in uninstall_rows:
+        by_app_un.setdefault(e["app"], []).append(e)
+
+    parts = []
+    # Licenses section (first)
+    for app, rows in by_app_lic.items():
+        header = f":tada: *New Marketplace licenses for {app}* ({date_label}, UTC)"
+        lines = []
+        for e in rows:
+            if e.get("contactName") and e.get("contactEmail"):
+                contact = f"{e['contactName']} ({e['contactEmail']})"
+            else:
+                contact = e.get("contactName") or e.get("contactEmail") or "—"
+            user_part = f" · {e['users']} users" if e.get("users") else ""
+            lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{user_part}")
+        parts.append(header + "\n" + "\n".join(lines))
+
+    # Uninstalls section (second)
+    for app, rows in by_app_un.items():
+        header = f":no_entry: *Uninstalls / Unsubscribes for {app}* ({date_label}, UTC)"
+        lines = []
+        for e in rows:
+            if e.get("contactName") and e.get("contactEmail"):
+                contact = f"{e['contactName']} ({e['contactEmail']})"
+            else:
+                contact = e.get("contactName") or e.get("contactEmail") or "—"
+            lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}")
+        parts.append(header + "\n" + "\n".join(lines))
+
+    text = "\n\n".join(parts)
+    r = requests.post(webhook, json={"text": text}, timeout=30)
+    r.raise_for_status()
+    print(f"Posted combined message: {sum(len(v) for v in by_app_lic.values())} licenses, {sum(len(v) for v in by_app_un.values())} uninstalls.")
+
+
+def main():
+    # fixed single-day window (yesterday or DAY=YYYY-MM-DD)
+    start_date, end_date = day_window_utc()
+
+    lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)   # you already have this
+    lic_rows  = pick_new_evaluations(lic_items, start_date, end_date)
+
+    un_items  = fetch_uninstalls(VENDOR_ID, start_date, end_date)
+    un_rows   = pick_uninstalls(un_items)
+
+    post_combined_to_slack(SLACK_WEBHOOK, lic_rows, un_rows, start_date, end_date)
