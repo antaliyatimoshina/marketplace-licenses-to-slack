@@ -2,7 +2,7 @@ name: Marketplace licenses → Slack
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # TEMP: every 5 minutes (UTC) to verify scheduling
+#    - cron: "*/5 * * * *"   # TEMP: every 5 minutes (UTC) to verify scheduling
     - cron: "30 6 * * *"   # 08:30 Kyiv when UTC+2 (winter), 09:30 when UTC+3 (summer)
   workflow_dispatch:
     inputs:
