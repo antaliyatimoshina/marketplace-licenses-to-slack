@@ -97,20 +97,13 @@ def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
 
 def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
-    Collect ANY new licenses (evaluation or commercial) and extract fields for Slack:
-      • {customer} · {contactName} ({contactEmail}) · {LICENSE_TYPE} [· {N users}]
-    Also include 'licenseId' (for logging) and 'appKey' (to merge with uninstall rows).
+    Map ANY new licenses (trial/paid) to rows for Slack and include:
+    - app  : pretty name
+    - appKey: canonical key for grouping with uninstall rows
+    - customer · contactName/email · licenseType · users (parsed from tier)
+    - licenseId: best available entitlement id
     """
     import re
-
-    def g(d, path):
-        cur = d
-        for k in path.split("."):
-            if isinstance(cur, dict) and k in cur:
-                cur = cur[k]
-            else:
-                return None
-        return cur
 
     def first(*vals):
         for v in vals:
@@ -120,58 +113,70 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
                 return v
         return None
 
-    def users_from_tier(tier):
-        if isinstance(tier, str):
-            m = re.search(r"(\d+)\s*Users?", tier, re.I)
+    rows = []
+    for lic in (items or []):
+        app_name = first(
+            lic.get("addonName"),
+            (lic.get("app") or {}).get("name"),
+            lic.get("appName"),
+            "Unknown app",
+        )
+        # <-- define the key right here; guaranteed to exist (falls back to name)
+        app_key = first(
+            lic.get("addonKey"),
+            (lic.get("app") or {}).get("key"),
+            app_name,
+        )
+
+        # contact/customer
+        cd   = lic.get("contactDetails") or {}
+        tech = cd.get("technicalContact") or {}
+        bill = cd.get("billingContact") or {}
+        site = lic.get("cloudSiteHostname")
+
+        def domain(email):
+            return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
+
+        customer = first(
+            cd.get("company"),
+            site,
+            domain(tech.get("email")),
+            domain(bill.get("email")),
+            tech.get("name"),
+            bill.get("name"),
+            "Unknown customer",
+        )
+        contact_name  = first(tech.get("name"),  bill.get("name"))
+        contact_email = first(tech.get("email"), bill.get("email"))
+
+        # type & users
+        license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
+        users = None
+        if isinstance(lic.get("tier"), str):
+            m = re.search(r"(\d+)\s*Users?", lic["tier"], re.I)
             if m:
-                return int(m.group(1))
-        return None
+                users = int(m.group(1))
 
-    def email_domain(email):
-        return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
-
-    def stable_id(lic: dict) -> str | None:
-        # Prefer the visible entitlement number (E-…)
-        return first(
+        # stable-ish id for logs/debug
+        license_id = first(
             lic.get("appEntitlementNumber"),
             lic.get("hostEntitlementNumber"),
             lic.get("appEntitlementId"),
             lic.get("hostEntitlementId"),
-            (f"{lic.get('addonKey')}::{lic.get('cloudId')}"
-             if lic.get('addonKey') and lic.get('cloudId') else None),
+            f"{lic.get('addonKey')}::{lic.get('cloudId')}" if lic.get("addonKey") and lic.get("cloudId") else None,
         )
-
-    rows = []
-    for lic in (items or []):
-        app_name = first(lic.get("addonName"), g(lic, "app.name"), lic.get("appName"), "Unknown app")
-        app_key  = first(lic.get("addonKey"), g(lic, "app.key"))  # <-- define app_key here
-
-        company     = g(lic, "contactDetails.company")
-        site        = lic.get("cloudSiteHostname")
-        tech_name   = g(lic, "contactDetails.technicalContact.name")
-        bill_name   = g(lic, "contactDetails.billingContact.name")
-        tech_email  = g(lic, "contactDetails.technicalContact.email")
-        bill_email  = g(lic, "contactDetails.billingContact.email")
-
-        customer = first(company, site, email_domain(tech_email), email_domain(bill_email),
-                         tech_name, bill_name, "Unknown customer")
-        contact_name  = first(tech_name, bill_name)
-        contact_email = first(tech_email, bill_email)
-
-        license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
-        users = users_from_tier(lic.get("tier"))
-        lid = stable_id(lic)
 
         rows.append({
             "app": app_name,
-            "appKey": app_key,          # used to merge with uninstall rows
+            "appKey": app_key,                # <-- now always defined
             "customer": customer,
             "contactName": contact_name,
             "contactEmail": contact_email,
             "licenseType": license_type,
             "users": users,
-            "licenseId": lid,
+            "licenseId": license_id,
         })
+
     return rows
 
 def fetch_uninstalls(vendor_id: str, start: dt.date, end: dt.date):
