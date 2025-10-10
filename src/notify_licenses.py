@@ -14,7 +14,6 @@ import requests
 #
 # Optional:
 # APPS              -> comma-separated app names to include (defaults to all)
-# LOOKBACK_DAYS     -> integer; check N days back instead of only "today" (default 0)
 
 def env(name, default=None, required=False):
     v = os.getenv(name, default)
@@ -30,7 +29,6 @@ SLACK_WEBHOOK = env("SLACK_WEBHOOK", required=True)
 DRY_RUN       = env("DRY_RUN") == "1"
 
 APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.strip()])
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "0"))
 
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
@@ -48,16 +46,8 @@ def day_window_utc():
         s = e
     return s, e
 
-# Run once/day and post *yesterday* only (single-day window)
-# This avoids re-posts and eventual-consistency hiccups.
-if os.getenv("MODE_YESTERDAY", "1") == "1":
-    start_date = today_utc - dt.timedelta(days=1)
-    end_date = start_date
-else:
-    # fallback to original behavior if you ever need it
-    LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "0"))
-    start_date = today_utc - dt.timedelta(days=LOOKBACK_DAYS)
-    end_date = today_utc
+# Pick the reporting day (yesterday by default, or DAY=YYYY-MM-DD for backfill)
+start_date, end_date = day_window_utc()
 
 def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
     """
@@ -324,16 +314,20 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
 def main():
     # fixed single-day window (yesterday or DAY=YYYY-MM-DD)
     start_date, end_date = day_window_utc()
+    print(f"[INFO] Daily window (UTC): {start_date}")
 
-    lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)   # you already have this
+    lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
     lic_rows  = pick_new_evaluations(lic_items, start_date, end_date)
 
     un_items  = fetch_uninstalls(VENDOR_ID, start_date, end_date)
     un_rows   = pick_uninstalls(un_items)
 
+    if not lic_rows and not un_rows:
+        # always post something so you know the job ran
+        requests.post(SLACK_WEBHOOK, json={"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
+        print("[INFO] No items; posted 'no changes' message to Slack.")
+        return
+
     post_combined_to_slack(SLACK_WEBHOOK, lic_rows, un_rows, start_date, end_date)
 
-    if not lic_rows and not un_rows:
-        requests.post(SLACK_WEBHOOK, json={"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
-    return
 
