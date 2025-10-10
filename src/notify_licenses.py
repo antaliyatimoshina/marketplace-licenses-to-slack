@@ -315,14 +315,23 @@ def main():
     start_date, end_date = day_window_utc()
     print(f"[INFO] Daily window (UTC): {start_date}")
 
-    lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
-    lic_rows  = pick_new_evaluations(lic_items, start_date, end_date)
+    try:
+        lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
+        lic_rows  = pick_new_evaluations(lic_items, start_date, end_date)
+        print(f"[INFO] Licenses: raw={len(lic_items)} mapped={len(lic_rows)}")
 
-    un_items  = fetch_uninstalls(VENDOR_ID, start_date, end_date)
-    un_rows   = pick_uninstalls(un_items)
+        un_items  = fetch_uninstalls(VENDOR_ID, start_date, end_date)
+        un_rows   = pick_uninstalls(un_items)
+        print(f"[INFO] Uninstalls: raw={len(un_items)} mapped={len(un_rows)}")
+    except Exception as e:
+        print(f"[ERROR] Exception during fetch/map: {e}")
+        # Optional: post the error to Slack (comment out if you prefer silent failures)
+        requests.post(SLACK_WEBHOOK, json={"text": f"❗ Script error: {e}"})
+        raise
 
     if not lic_rows and not un_rows:
-        requests.post(SLACK_WEBHOOK, json={"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
+        msg = {"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."}
+        requests.post(SLACK_WEBHOOK, json=msg)
         print("[INFO] No items; posted 'no changes' message to Slack.")
         return
 
