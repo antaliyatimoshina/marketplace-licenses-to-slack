@@ -1,6 +1,6 @@
-# Marketplace trials → Slack (free)
+# Marketplace licenses → Slack (free)
 
-Polls the Atlassian **Marketplace Reporting API** for **new evaluation licenses** (trials) in a UTC date window and posts a compact summary to Slack via **Incoming Webhook**.
+Polls the Atlassian Marketplace Reporting API once per day for new licenses (trials + paid) and uninstalls/unsubscribes/disable events for a single UTC date (yesterday by default), then posts one compact message to Slack via Incoming Webhook. No state is stored.
 
 ## Setup
 
@@ -22,20 +22,18 @@ Polls the Atlassian **Marketplace Reporting API** for **new evaluation licenses*
 
 5. (Optional) Add `APPS` secret like `Mria CRM: CRM for Jira Teams` to limit to specific app(s).  
    Use comma-separated names for multiple apps.  
-   Add `LOOKBACK_DAYS` (e.g., `1`) if you want to cover the last N days.
 
 6. **Enable the workflow**
-   - It runs every 30 minutes (UTC). You can also run it manually from the Actions tab.
-
+   - It runs everyday at 7:00 (UTC).
+     
 ## What it does
 
-- Calls: `GET /rest/2/vendors/{vendorId}/reporting/licenses?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD`
-- Filters to `evaluationLicense == true` with `evaluationStartDate` within the window.
-- Posts a single message summarizing new trials.
+- Calls: `GET /rest/2/vendors/{vendorId}/reporting/licenses/export?accept=json&dateType=start&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD` (new licenses: trials + paid)
+- Calls: `GET /rest/2/vendors/{vendorId}/reporting/feedback/details/export?accept=json&type=uninstall&type=unsubscribe&type=disable&startDate=YYYY-MM-DD&endDate=YYY
 
 ## Notes
 
-- The Marketplace API is eventually consistent; using a small **LOOKBACK_DAYS** (0–1) helps avoid misses.
+- The Marketplace API is eventually consistent;
 - No Slack app/bot token required — Incoming Webhooks are sufficient.
 - Keep the repo private if you store any customization; **secrets are safe** in Actions.
 
