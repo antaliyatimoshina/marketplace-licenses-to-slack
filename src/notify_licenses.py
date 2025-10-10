@@ -336,3 +336,16 @@ def main():
         return
 
     post_combined_to_slack(SLACK_WEBHOOK, lic_rows, un_rows, start_date, end_date)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        # make failures visible in logs (and optionally in Slack)
+        import traceback, os, requests
+        traceback.print_exc()
+        hook = os.getenv("SLACK_WEBHOOK")
+        if hook:
+            requests.post(hook, json={"text": f"❗ notify_licenses.py crashed: {e}"})
+        raise
+
