@@ -163,6 +163,7 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
 
         rows.append({
             "app": app_name,
+            "appKey": app_key,
             "customer": customer,
             "contactName": contact_name,
             "contactEmail": contact_email,
@@ -225,6 +226,7 @@ def pick_uninstalls(items):
 
         rows.append({
             "app": app,
+            "appKey": app_key,
             "customer": cust,
             "contactName": name,
             "contactEmail": email,
@@ -268,75 +270,74 @@ def post_to_slack(webhook, items, start: dt.date, end: dt.date):
 
 def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date):
     """
-    One message per app:
-    {App} Marketplace Events (YYYY-MM-DD, UTC)
-
-    ✈️ New licenses
-    • customer · Name (email) · TYPE [· N users]
-
-    ➖ Uninstalls / Unsubscribes
-    • customer/site · Name (email) · TYPE
+    One message per appKey:
+      {Pretty App Name} Marketplace Events (YYYY-MM-DD, UTC)
+      ✈️ New licenses
+      • customer · Name (email) · TYPE [· N users]
+      
+      ➖ Uninstalls / Unsubscribes
+      • customer/site · Name (email) · TYPE
     """
+    import re
+
     if not licenses_rows and not uninstall_rows:
         requests.post(webhook, json={"text": f"ℹ️ No new licenses or uninstalls for {start.isoformat()} (UTC)."})
         print("Nothing to post.")
         return
 
-    # group rows by app
-    by_app_lic = {}
-    for r in licenses_rows or []:
-        by_app_lic.setdefault(r["app"], []).append(r)
+    def prettiest_name(candidates):
+        # Prefer names that have spaces/colon (human labels) over bare keys
+        cand = sorted(candidates, key=lambda s: (":" not in s and " " not in s, len(s)))
+        return cand[0] if cand else "Unknown app"
 
-    by_app_un = {}
-    for r in uninstall_rows or []:
-        by_app_un.setdefault(r["app"], []).append(r)
+    # Group by canonical key
+    groups = {}
+    for r in (licenses_rows or []):
+        k = r.get("appKey") or r.get("app")
+        g = groups.setdefault(k, {"names": set(), "lic": [], "un": []})
+        g["names"].add(r.get("app") or "")
+        g["lic"].append(r)
+    for r in (uninstall_rows or []):
+        k = r.get("appKey") or r.get("app")
+        g = groups.setdefault(k, {"names": set(), "lic": [], "un": []})
+        g["names"].add(r.get("app") or "")
+        g["un"].append(r)
 
-    date_label = start.isoformat()  # single-day summary
+    date_label = start.isoformat()
     parts = []
+    for k in sorted(groups.keys() or []):
+        g = groups[k]
+        app_title = prettiest_name(g["names"])
+        section_lines = []
 
-    # union of all apps present in either section
-    apps = sorted(set(list(by_app_lic.keys()) + list(by_app_un.keys())))
-
-    for app in apps:
-        lic_rows = by_app_lic.get(app, [])
-        un_rows  = by_app_un.get(app, [])
-
-        header = f"{app} Marketplace Events ({date_label}, UTC)"
-        body_sections = []
-
-        if lic_rows:
+        if g["lic"]:
             lines = []
-            for e in lic_rows:
+            for e in g["lic"]:
                 if e.get("contactName") and e.get("contactEmail"):
                     contact = f"{e['contactName']} ({e['contactEmail']})"
                 else:
                     contact = e.get("contactName") or e.get("contactEmail") or "—"
                 users_part = f" · {e['users']} users" if e.get("users") else ""
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}")
-            body_sections.append(":airplane: New licenses\n" + "\n".join(lines))
+            section_lines.append(":airplane: New licenses\n" + "\n".join(lines))
 
-        if un_rows:
+        if g["un"]:
             lines = []
-            for e in un_rows:
+            for e in g["un"]:
                 if e.get("contactName") and e.get("contactEmail"):
                     contact = f"{e['contactName']} ({e['contactEmail']})"
                 else:
                     contact = e.get("contactName") or e.get("contactEmail") or "—"
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}")
-            body_sections.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
+            section_lines.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
 
-        # If you want to always show both sections even when empty, uncomment:
-        # if not lic_rows:
-        #     body_sections.append(":airplane: New licenses\n• —")
-        # if not un_rows:
-        #     body_sections.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n• —")
-
-        parts.append(header + "\n\n" + "\n\n".join(body_sections))
+        parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_lines))
 
     text = "\n\n".join(parts)
     r = requests.post(webhook, json={"text": text}, timeout=30)
     r.raise_for_status()
-    print("Posted combined message (new format).")
+    print("Posted combined message (merged by appKey).")
+
 
 def main():
     start_date, end_date = day_window_utc()
