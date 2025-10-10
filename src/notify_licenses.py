@@ -343,56 +343,63 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
     """
     One message per appKey:
       {Pretty App Name} Marketplace Events (YYYY-MM-DD, UTC)
-      ✈️ New licenses
-      • customer · Name (email) · TYPE [· N users]
-      
-      ➖ Uninstalls / Unsubscribes
-      • customer/site · Name (email) · TYPE
+
+    ✈️ New licenses
+    • customer · Name (email) · TYPE [· N users] [· E-...]
+    
+    ➖ Uninstalls / Unsubscribes
+    • customer/site · Name (email) · TYPE [· E-...]
     """
-    import re
-
-    if not licenses_rows and not uninstall_rows:
-        requests.post(webhook, json={"text": f"ℹ️ No new licenses or uninstalls for {start.isoformat()} (UTC)."})
-        print("Nothing to post.")
-        return
-
-    def prettiest_name(candidates):
-        # Prefer names that have spaces/colon (human labels) over bare keys
-        cand = sorted(candidates, key=lambda s: (":" not in s and " " not in s, len(s)))
-        return cand[0] if cand else "Unknown app"
-
     # Group by canonical key
     groups = {}
     for r in (licenses_rows or []):
-        k = r.get("appKey") or r.get("app")
+        k = r.get("appKey") or r.get("app") or "unknown"
         g = groups.setdefault(k, {"names": set(), "lic": [], "un": []})
-        g["names"].add(r.get("app") or "")
+        if r.get("app"):
+            g["names"].add(r["app"])
         g["lic"].append(r)
+
     for r in (uninstall_rows or []):
-        k = r.get("appKey") or r.get("app")
+        k = r.get("appKey") or r.get("app") or "unknown"
         g = groups.setdefault(k, {"names": set(), "lic": [], "un": []})
-        g["names"].add(r.get("app") or "")
+        if r.get("app"):
+            g["names"].add(r["app"])
         g["un"].append(r)
 
+    if not groups:
+        slack_post({"text": f"ℹ️ No new licenses or uninstalls for {start.isoformat()} (UTC)."})
+        print("Nothing to post.")
+        return
+
+    def prettiest_name(names: set[str]) -> str:
+        if not names:
+            return "Unknown app"
+        # prefer human-looking names (with spaces/colon)
+        return sorted(names, key=lambda s: (":" not in s and " " not in s, len(s)))[0]
+
     date_label = start.isoformat()
-    parts = []
-    for k in sorted(groups.keys() or []):
+    parts: list[str] = []
+
+    for k in sorted(groups.keys()):
         g = groups[k]
         app_title = prettiest_name(g["names"])
-        section_lines = []
 
+        section_chunks: list[str] = []
+
+        # New licenses section
         if g["lic"]:
             lines = []
             for e in g["lic"]:
-                ]if e.get("contactName") and e.get("contactEmail"):
+                if e.get("contactName") and e.get("contactEmail"):
                     contact = f"{e['contactName']} ({e['contactEmail']})"
                 else:
                     contact = e.get("contactName") or e.get("contactEmail") or "—"
                 users_part = f" · {e['users']} users" if e.get("users") else ""
-                id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""  # <— ADD
+                id_part    = f" · {e['licenseId']}"   if e.get("licenseId") else ""
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
-            section_lines.append(":airplane: New licenses\n" + "\n".join(lines))
+            section_chunks.append(":airplane: New licenses\n" + "\n".join(lines))
 
+        # Uninstalls section
         if g["un"]:
             lines = []
             for e in g["un"]:
@@ -402,15 +409,13 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                     contact = e.get("contactName") or e.get("contactEmail") or "—"
                 id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{id_part}")
+            section_chunks.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
 
-            section_lines.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
-
-        parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_lines))
+        parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_chunks))
 
     text = "\n\n".join(parts)
     slack_post({"text": text})
     print("Posted combined message (merged by appKey).")
-
 
 def main():
     start_date, end_date = day_window_utc()
