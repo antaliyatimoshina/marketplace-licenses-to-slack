@@ -99,7 +99,7 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
     """
     Collect ANY new licenses (evaluation or commercial) and extract fields for Slack:
       • {customer} · {contactName} ({contactEmail}) · {LICENSE_TYPE} [· {N users}]
-    Also include a stable 'licenseId' for de-dup (prefers E-… entitlement number).
+    Also include a stable 'licenseId' for de-dup/reporting and 'appKey' for grouping.
     """
     import re
 
@@ -142,8 +142,9 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         )
 
     rows = []
-    for lic in items:
+    for lic in items or []:
         app_name = first(lic.get("addonName"), g(lic, "app.name"), lic.get("appName"), "Unknown app")
+        app_key  = first(lic.get("addonKey"), g(lic, "app.key"))  # <-- define app_key
 
         company     = g(lic, "contactDetails.company")
         site        = lic.get("cloudSiteHostname")
@@ -158,18 +159,17 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
 
         license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
         users = users_from_tier(lic.get("tier"))
-
         lid = dedup_id(lic)
 
         rows.append({
             "app": app_name,
-            "appKey": app_key,
+            "appKey": app_key,          # <-- used to merge with uninstall rows
             "customer": customer,
             "contactName": contact_name,
             "contactEmail": contact_email,
             "licenseType": license_type,
             "users": users,
-            "licenseId": lid,   # <-- critical for de-dup
+            "licenseId": lid,
         })
     return rows
 
