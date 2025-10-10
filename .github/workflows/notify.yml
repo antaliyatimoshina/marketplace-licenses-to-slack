@@ -17,19 +17,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # --- debug: show current UTC time in logs
-      - name: Show UTC time
-        run: date -u
-
-      # --- debug: Slack smoke test (should appear immediately in your channel)
-      - name: Slack smoke test
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-        run: |
-          curl -fsS -X POST -H 'Content-type: application/json' \
-            --data '{"text":"(smoke) GitHub Actions can post to this webhook."}' \
-            "$SLACK_WEBHOOK"
-
       - run: pip install -r requirements.txt
 
       - name: Notify Slack about new items
