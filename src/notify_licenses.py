@@ -312,7 +312,6 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
 
 
 def main():
-    # fixed single-day window (yesterday or DAY=YYYY-MM-DD)
     start_date, end_date = day_window_utc()
     print(f"[INFO] Daily window (UTC): {start_date}")
 
@@ -323,11 +322,8 @@ def main():
     un_rows   = pick_uninstalls(un_items)
 
     if not lic_rows and not un_rows:
-        # always post something so you know the job ran
         requests.post(SLACK_WEBHOOK, json={"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
         print("[INFO] No items; posted 'no changes' message to Slack.")
         return
 
     post_combined_to_slack(SLACK_WEBHOOK, lic_rows, un_rows, start_date, end_date)
-
-
