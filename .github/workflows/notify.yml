@@ -2,7 +2,7 @@ name: Marketplace licenses → Slack
 
 on:
   schedule:
-    - cron: "0 7 * * *"   # 09:00 Kyiv when UTC+2 (winter)
+    - cron: "0 7 * * *"   # 09:00 Kyiv when UTC+2 (winter), 10:00 when UTC+3 (summer)
   workflow_dispatch:          # allow manual runs
 
 jobs:
@@ -22,8 +22,6 @@ jobs:
           MP_API_TOKEN: ${{ secrets.MP_API_TOKEN }}
           VENDOR_ID: ${{ secrets.VENDOR_ID }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          MODE_YESTERDAY: "1"
           # Optional filters:
           # APPS: "Mria CRM: CRM for Jira Teams"   # only this app
-          LOOKBACK_DAYS: "7"                     # scan yesterday+today
         run: python src/notify_licenses.py
