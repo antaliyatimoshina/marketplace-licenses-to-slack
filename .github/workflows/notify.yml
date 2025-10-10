@@ -4,7 +4,12 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # TEMP: every 5 minutes (UTC) to verify scheduling
     - cron: "30 6 * * *"   # 08:30 Kyiv when UTC+2 (winter), 09:30 when UTC+3 (summer)
-  workflow_dispatch:          # allow manual runs
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no Slack post)?"
+        type: boolean
+        default: true
 
 jobs:
   notify:
@@ -16,15 +21,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - run: pip install -r requirements.txt
 
-      - name: Notify Slack about new items
+      - name: Notify Slack about marketplace events
         env:
           MP_USER: ${{ secrets.MP_USER }}
           MP_API_TOKEN: ${{ secrets.MP_API_TOKEN }}
           VENDOR_ID: ${{ secrets.VENDOR_ID }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          # Optional backfill for manual runs:
-          # DAY: "2025-10-10"
+          # DRY_RUN:
+          # - For scheduled runs (cron), post for real:
+          DRY_RUN: ${{ github.event_name == 'schedule' && '0' || (inputs.dry_run && '1' || '0') }}
+          # Optional: backfill a specific day on manual runs:
+          # DAY: "2025-10-09"
         run: python src/notify_licenses.py
