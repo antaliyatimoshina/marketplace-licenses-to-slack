@@ -26,7 +26,16 @@ MP_USER       = env("MP_USER", required=True)
 MP_API_TOKEN  = env("MP_API_TOKEN", required=True)
 VENDOR_ID     = env("VENDOR_ID", required=True)
 SLACK_WEBHOOK = env("SLACK_WEBHOOK", required=True)
-DRY_RUN       = env("DRY_RUN") == "1"
+DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+
+def slack_post(payload: dict):
+    """Post to Slack unless DRY_RUN=1, in which case just log."""
+    if DRY_RUN:
+        print("[DRY_RUN] Would post to Slack:\n" + payload.get("text","")[:2000])
+        return
+    r = requests.post(SLACK_WEBHOOK, json=payload, timeout=30)
+    r.raise_for_status()
+
 
 APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.strip()])
 
@@ -363,8 +372,7 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
         parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_lines))
 
     text = "\n\n".join(parts)
-    r = requests.post(webhook, json={"text": text}, timeout=30)
-    r.raise_for_status()
+    slack_post({"text": text})
     print("Posted combined message (merged by appKey).")
 
 
@@ -383,12 +391,12 @@ def main():
     except Exception as e:
         print(f"[ERROR] Exception during fetch/map: {e}")
         # Optional: post the error to Slack (comment out if you prefer silent failures)
-        requests.post(SLACK_WEBHOOK, json={"text": f"❗ Script error: {e}"})
+        # requests.post(SLACK_WEBHOOK, json={"text": f"❗ Script error: {e}"})
         raise
 
     if not lic_rows and not un_rows:
         msg = {"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."}
-        requests.post(SLACK_WEBHOOK, json=msg)
+        slack_post({"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
         print("[INFO] No items; posted 'no changes' message to Slack.")
         return
 
