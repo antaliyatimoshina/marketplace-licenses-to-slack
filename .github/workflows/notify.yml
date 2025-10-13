@@ -33,5 +33,5 @@ jobs:
           # - For scheduled runs (cron), post for real:
           DRY_RUN: ${{ github.event_name == 'schedule' && '0' || (inputs.dry_run && '1' || '0') }}
           # Optional: backfill a specific day on manual runs:
-          DAY: "2025-10-10"
+          # DAY: "2025-10-10"
         run: python src/notify_licenses.py
