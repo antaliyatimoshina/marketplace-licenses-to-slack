@@ -60,6 +60,16 @@ def _extract_license_id(lic: dict):
          if lic.get("addonKey") and lic.get("cloudId") else None),
     )
 
+CONVERSION_LOOKBACK_DAYS = int(os.getenv("CONVERSION_LOOKBACK_DAYS", "45"))
+
+def _parse_date(s: str | None):
+    if not s:
+        return None
+    try:
+        return dt.date.fromisoformat(s[:10])
+    except Exception:
+        return None
+
 def day_window_utc():
     """
     Returns (start_date, end_date) as the same YYYY-MM-DD date in UTC.
@@ -199,15 +209,31 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
              if lic.get("addonKey") and lic.get("cloudId") else None),
         )
 
+        start_dt = _parse_date(
+            lic.get("maintenanceStartDate")
+            or lic.get("latestMaintenanceStartDate")
+            or lic.get("evaluationStartDate")
+        )
+        trial_dt = _parse_date(lic.get("latestEvaluationStartDate"))
+        
+        is_paid = license_type not in ("EVALUATION", "EVAL", "TRIAL")
+        is_conversion = (
+            is_paid and trial_dt and start_dt and
+            (start_dt - trial_dt).days >= 0 and
+            (start_dt - trial_dt).days <= CONVERSION_LOOKBACK_DAYS
+        )
+
         rows.append({
             "app": app_name,
-            "appKey": app_key_expr,          # <— computed inline; no NameError possible
+            "appKey": app_key_expr,
             "customer": customer,
             "contactName": contact_name,
             "contactEmail": contact_email,
             "licenseType": license_type,
             "users": users,
             "licenseId": license_id,
+            "isConversion": bool(is_conversion),
+            "trialStarted": trial_dt.isoformat() if trial_dt else None,
         })
 
     return rows
@@ -307,38 +333,6 @@ def pick_uninstalls(items, name_map=None):
         })
     return rows
 
-def post_to_slack(webhook, items, start: dt.date, end: dt.date):
-    if not items:
-        print("No new licenses for window:", start, "→", end)
-        return
-
-    by_app = {}
-    for e in items:
-        by_app.setdefault(e["app"], []).append(e)
-
-    date_label = start.isoformat() if start == end else f"{start.isoformat()}–{end.isoformat()}"
-
-    blocks = []
-    for app, rows in by_app.items():
-        header = f":airplane: *New Marketplace licenses for {app}* ({date_label}, UTC)"
-        lines = []
-        for e in rows:
-            if e.get("contactName") and e.get("contactEmail"):
-                contact = f"{e['contactName']} ({e['contactEmail']})"
-            else:
-                contact = e.get("contactName") or e.get("contactEmail") or "—"
-            user_part = f" · {e['users']} users" if e.get("users") else ""
-            lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{user_part}")
-        blocks.append(header + "\n" + "\n".join(lines))
-
-    text = "\n\n".join(blocks)
-    if DRY_RUN:
-        print("DRY_RUN=1 → would post:\n" + "\n".join(lines if isinstance(lines, list) else [text]))
-    return
-    r = requests.post(webhook, json={"text": text}, timeout=30)
-    r.raise_for_status()
-    print(f"Posted {sum(len(v) for v in by_app.values())} item(s) to Slack.")
-
 def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date):
     """
     One message per appKey:
@@ -379,39 +373,68 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
 
     date_label = start.isoformat()
     parts: list[str] = []
-
+    
     for k in sorted(groups.keys()):
         g = groups[k]
         app_title = prettiest_name(g["names"])
-
+    
         section_chunks: list[str] = []
-
-        # New licenses section
-        if g["lic"]:
+    
+        # app-scoped rows
+        lic_rows = g["lic"]
+        un_rows  = g["un"]
+    
+        # 1) split licenses into conversions vs non-conversions
+        paid_conversions = [e for e in lic_rows if e.get("isConversion")]
+        new_nonconversion = [e for e in lic_rows if not e.get("isConversion")]
+    
+        # (optional) same-day reinstall marker
+        reinstalled_ids = {e["licenseId"] for e in lic_rows if e.get("licenseId")}
+    
+        # Conversions
+        if paid_conversions:
             lines = []
-            for e in g["lic"]:
-                if e.get("contactName") and e.get("contactEmail"):
-                    contact = f"{e['contactName']} ({e['contactEmail']})"
-                else:
-                    contact = e.get("contactName") or e.get("contactEmail") or "—"
+            for e in paid_conversions:
+                contact = (
+                    f"{e['contactName']} ({e['contactEmail']})"
+                    if e.get("contactName") and e.get("contactEmail")
+                    else (e.get("contactName") or e.get("contactEmail") or "—")
+                )
                 users_part = f" · {e['users']} users" if e.get("users") else ""
-                id_part    = f" · {e['licenseId']}"   if e.get("licenseId") else ""
+                id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
+                trial_part = f" (trial started {e['trialStarted']})" if e.get("trialStarted") else ""
+                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}{trial_part}")
+            section_chunks.append(":moneybag: Conversions (trial → paid)\n" + "\n".join(lines))
+    
+        # New licenses (non-conversions)
+        if new_nonconversion:
+            lines = []
+            for e in new_nonconversion:
+                contact = (
+                    f"{e['contactName']} ({e['contactEmail']})"
+                    if e.get("contactName") and e.get("contactEmail")
+                    else (e.get("contactName") or e.get("contactEmail") or "—")
+                )
+                users_part = f" · {e['users']} users" if e.get("users") else ""
+                id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
             section_chunks.append(":airplane: New licenses\n" + "\n".join(lines))
-
-        # Uninstalls section
-        if g["un"]:
+    
+        # Uninstalls / Unsubscribes (keep your existing loop, but you can add same-day reinstall flag)
+        if un_rows:
             lines = []
-            for e in g["un"]:
-                if e.get("contactName") and e.get("contactEmail"):
-                    contact = f"{e['contactName']} ({e['contactEmail']})"
-                else:
-                    contact = e.get("contactName") or e.get("contactEmail") or "—"
+            for e in un_rows:
+                contact = (
+                    f"{e['contactName']} ({e['contactEmail']})"
+                    if e.get("contactName") and e.get("contactEmail")
+                    else (e.get("contactName") or e.get("contactEmail") or "—")
+                )
                 id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""
-                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{id_part}")
+                reinst_part = " (same-day reinstall)" if e.get("licenseId") in reinstalled_ids else ""
+                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{id_part}{reinst_part}")
             section_chunks.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
 
-        parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_chunks))
+    parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_chunks))
 
     text = "\n\n".join(parts)
     slack_post({"text": text})
