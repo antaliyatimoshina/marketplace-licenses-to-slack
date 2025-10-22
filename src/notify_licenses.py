@@ -28,6 +28,32 @@ VENDOR_ID     = env("VENDOR_ID", required=True)
 SLACK_WEBHOOK = env("SLACK_WEBHOOK", required=True)
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
+CONVERSION_LOOKBACK_DAYS = int(os.getenv("CONVERSION_LOOKBACK_DAYS", "60"))
+
+def _iso10(s):
+    return (s or "")[:10] if isinstance(s, str) else None
+
+def infer_conversions_from_licenses(lic_items, target: dt.date):
+    """
+    Heuristic conversion finder for day=target:
+      - license is COMMERCIAL/PAID (not evaluation)
+      - had a trial (latestEvaluationStartDate present)
+      - license row was updated on the target date (lastUpdated == target)
+    Returns a filtered subset of lic_items (raw dicts).
+    """
+    want = []
+    tgt = target.isoformat()
+    for lic in lic_items or []:
+        lt = (lic.get("licenseType") or lic.get("tier") or "").upper()
+        if lt not in ("COMMERCIAL", "PAID"):
+            continue
+        if not _iso10(lic.get("latestEvaluationStartDate")):
+            continue
+        if _iso10(lic.get("lastUpdated")) != tgt:
+            continue
+        want.append(lic)
+    return want
+
 def slack_post(payload: dict):
     """Post to Slack unless DRY_RUN=1, in which case just log."""
     if DRY_RUN:
@@ -644,37 +670,51 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
     print("Posted combined message (merged by appKey).")
 
 def main():
-
     start_date, end_date = day_window_utc()
     print(f"[INFO] Daily window (UTC): {start_date}")
 
-    # Optional debug: show last 7 days of transactions in logs
-    #if os.getenv("DEBUG_TX", "0") == "1":
-    week_start = (start_date - dt.timedelta(days=7))
-    tx_items = fetch_transactions(VENDOR_ID, week_start, end_date or start_date)
-    debug_dump_transactions(tx_items)
+    # 2a) Wide fetch for conversion inference (uses lastUpdated on the target date)
+    wide_start = start_date - dt.timedelta(days=CONVERSION_LOOKBACK_DAYS)
+    lic_items_wide = fetch_licenses(VENDOR_ID, wide_start, end_date)   # existing function
 
-    try:
-        lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
-        lic_rows  = pick_new_evaluations(lic_items, start_date, end_date)
-        print(f"[INFO] Licenses: raw={len(lic_items)} mapped={len(lic_rows)}")
+    inferred_raw = infer_conversions_from_licenses(lic_items_wide, start_date)
+    conv_rows = pick_new_evaluations(inferred_raw, start_date, end_date)  # reuse your mapper
+    # mark as conversions + carry trial start date if present
+    # build a quick index by licenseId so we can annotate trialStarted:
+    raw_by_ent = {}
+    for lic in inferred_raw:
+        ent = lic.get("appEntitlementNumber") or lic.get("hostEntitlementNumber")
+        if ent:
+            raw_by_ent[ent] = lic
+    for r in conv_rows:
+        r["isConversion"] = True
+        ent = r.get("licenseId")
+        trial_dt = _iso10(raw_by_ent.get(ent, {}).get("latestEvaluationStartDate")) if ent else None
+        if trial_dt:
+            r["trialStarted"] = trial_dt
 
-        un_items  = fetch_uninstalls(VENDOR_ID, start_date, end_date)
-        un_rows   = pick_uninstalls(un_items)
-        print(f"[INFO] Uninstalls: raw={len(un_items)} mapped={len(un_rows)}")
-    except Exception as e:
-        print(f"[ERROR] Exception during fetch/map: {e}")
-        # Optional: post the error to Slack (comment out if you prefer silent failures)
-        # requests.post(SLACK_WEBHOOK, json={"text": f"❗ Script error: {e}"})
-        raise
+    # 2b) Normal single-day license rows (new starts etc.)
+    lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
+    lic_rows  = pick_new_evaluations(lic_items, start_date, end_date)
 
-    if not lic_rows and not un_rows:
-        msg = {"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."}
+    # 2c) Uninstalls (your existing path)
+    un_items = fetch_uninstalls(VENDOR_ID, start_date, end_date)
+    name_map = build_app_name_map(lic_items, un_items)
+    un_rows  = pick_uninstalls(un_items, name_map=name_map)
+
+    # 2d) Merge conversions + de-dupe by licenseId so they don’t also appear under New licenses
+    seen_ids = {r.get("licenseId") for r in conv_rows if r.get("licenseId")}
+    lic_rows_filtered = [r for r in lic_rows if r.get("licenseId") not in seen_ids]
+    lic_rows_final = conv_rows + lic_rows_filtered
+
+    print(f"[INFO] Licenses mapped: {len(lic_rows_final)} | Conversions inferred: {len(conv_rows)} | Uninstalls mapped: {len(un_rows)}")
+
+    if not lic_rows_final and not un_rows:
         slack_post({"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
         print("[INFO] No items; posted 'no changes' message to Slack.")
         return
 
-    post_combined_to_slack(SLACK_WEBHOOK, lic_rows, un_rows, start_date, end_date)
+    post_combined_to_slack(SLACK_WEBHOOK, lic_rows_final, un_rows, start_date, end_date)
 
 if __name__ == "__main__":
     try:
