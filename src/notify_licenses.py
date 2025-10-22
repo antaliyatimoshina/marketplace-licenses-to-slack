@@ -44,44 +44,54 @@ today_utc = dt.datetime.utcnow().date()
 
 def fetch_cloud_conversions(vendor_id: str, start: dt.date, end: dt.date):
     """
-    Cloud conversions report (trial → paid) for a date window (UTC).
-    Tries both the 'export' and base endpoints; normalizes to a list.
-    Expected to match the UI item 'Cloud conversions'.
+    Transactions for a date window (UTC).
+    Tries export/base endpoints, first with include=zeroTransactions, then without.
+    Normalizes to a list.
     """
     base = "https://marketplace.atlassian.com"
     endpoints = [
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/cloud/conversions/export",
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/cloud/conversions",
+        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions/export",
+        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions",
     ]
-    params = {
-        "startDate": start.isoformat(),
-        "endDate": end.isoformat(),
-        "accept": "json",
-    }
+    # try with and without the include=zeroTransactions switch the UI uses
+    param_variants = [
+        {"startDate": start.isoformat(), "endDate": end.isoformat(), "accept": "json", "include": "zeroTransactions"},
+        {"startDate": start.isoformat(), "endDate": end.isoformat(), "accept": "json"},
+    ]
     headers = {"Accept": "application/json"}
     last_err = None
-    for url in endpoints:
-        try:
-            r = requests.get(url, params=params, headers=headers,
-                             auth=(MP_USER, MP_API_TOKEN), timeout=60)
-            if r.status_code == 404:
-                last_err = f"404 on {url}"
-                continue
-            r.raise_for_status()
-            data = r.json()
-            # API sometimes returns a bare list or {"conversions":[...]}
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                items = data.get("conversions")
-                return items if isinstance(items, list) else []
-            return []
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            continue
-    print(f"[WARN] fetch_cloud_conversions failed on all endpoints: {last_err}")
-    return []
 
+    for url in endpoints:
+        for params in param_variants:
+            try:
+                r = requests.get(url, params=params, headers=headers,
+                                 auth=(MP_USER, MP_API_TOKEN), timeout=60)
+                # Some tenants return 404 on one variant but not the other
+                if r.status_code == 404:
+                    last_err = f"404 on {r.url}"
+                    continue
+                # 204/empty bodies → keep trying next variant
+                if r.status_code == 204 or not r.content:
+                    last_err = f"{r.status_code} no content on {r.url}"
+                    continue
+
+                r.raise_for_status()
+                data = r.json()
+                # API sometimes returns a list or {"transactions":[...]}
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    items = data.get("transactions")
+                    if isinstance(items, list):
+                        return items
+                # fall through to try next variant
+                last_err = f"unexpected JSON on {r.url}"
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e} on {url}"
+                continue
+
+    print(f"[WARN] fetch_transactions failed on all attempts: {last_err}")
+    return []
 
 def debug_dump_conversions(items, prefix="[CONV]"):
     """
@@ -109,52 +119,6 @@ def debug_dump_conversions(items, prefix="[CONV]"):
         users = first(c.get("users"), c.get("seats"), c.get("quantity"))
         users_s = f" · {users} users" if users else ""
         print(f"{prefix} {i:02d} • {when} • {app} • {cust} • {ent}{users_s} • key={key}")
-
-def fetch_sales(vendor_id: str, start: dt.date, end: dt.date):
-    base = "https://marketplace.atlassian.com"
-    endpoints = [
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/sales/export",
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/sales",
-    ]
-    params = {"startDate": start.isoformat(), "endDate": end.isoformat(), "accept": "json"}
-    headers = {"Accept": "application/json"}
-    last_err = None
-    for url in endpoints:
-        try:
-            r = requests.get(url, params=params, headers=headers,
-                             auth=(MP_USER, MP_API_TOKEN), timeout=60)
-            if r.status_code == 404:
-                last_err = f"404 on {url}"
-                continue
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list): return data
-            if isinstance(data, dict): return data.get("sales", [])
-            return []
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            continue
-    print(f"[WARN] fetch_sales failed on all endpoints: {last_err}")
-    return []
-
-def debug_dump_sales(items, prefix="[SALES]"):
-    def first(*vals):
-        for v in vals:
-            if isinstance(v, str) and v.strip(): return v.strip()
-            if v not in (None, "", [], {}): return v
-        return None
-    print(f"{prefix} total: {len(items)}")
-    for i, s in enumerate(items[:100], 1):
-        when  = first(s.get("date"), s.get("transactionDate"), s.get("created"))
-        app   = first(s.get("addonName"), (s.get("app") or {}).get("name"), "Unknown app")
-        key   = first(s.get("addonKey"),  (s.get("app") or {}).get("key"))
-        ent   = first(s.get("appEntitlementNumber"), s.get("entitlementNumber"))
-        kind  = (first(s.get("transactionType"), s.get("type")) or "").upper()
-        lic   = (first(s.get("licenseType"), s.get("license")) or "").title()
-        users = first(s.get("users"), s.get("seats"), s.get("quantity"))
-        cust  = first((s.get("contactDetails") or {}).get("company"), s.get("customer"), s.get("accountName"), "—")
-        print(f"{prefix} {i:02d} • {when} • {app} • {kind}/{lic} • {cust} • {ent} • key={key} • users={users}")
-
 
 
 def _extract_license_id(lic: dict):
@@ -565,10 +529,6 @@ def main():
     week_start = (start_date or dt.date.today()) - dt.timedelta(days=7)
     conv_items = fetch_cloud_conversions(VENDOR_ID, week_start, end_date or start_date)
     debug_dump_conversions(conv_items)
-
-    week_start = start_date - dt.timedelta(days=7)
-    sales = fetch_sales(VENDOR_ID, week_start, end_date or start_date)
-    debug_dump_sales(sales)
 
     try:
         lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
