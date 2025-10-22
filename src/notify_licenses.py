@@ -42,24 +42,16 @@ APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.str
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
 
-def _json_list_or_key(data, key):
-    """Marketplace sometimes returns a list, sometimes {'key': [...]}."""
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        v = data.get(key)
-        return v if isinstance(v, list) else []
-    return []
-
-def fetch_transactions(vendor_id: str, start: dt.date, end: dt.date):
+def fetch_cloud_conversions(vendor_id: str, start: dt.date, end: dt.date):
     """
-    Transactions for a date window (UTC).
-    Tries both /export and base endpoint, normalizes to a list.
+    Cloud conversions report (trial → paid) for a date window (UTC).
+    Tries both the 'export' and base endpoints; normalizes to a list.
+    Expected to match the UI item 'Cloud conversions'.
     """
     base = "https://marketplace.atlassian.com"
     endpoints = [
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions/export",
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions",
+        f"{base}/rest/2/vendors/{vendor_id}/reporting/cloud/conversions/export",
+        f"{base}/rest/2/vendors/{vendor_id}/reporting/cloud/conversions",
     ]
     params = {
         "startDate": start.isoformat(),
@@ -77,18 +69,23 @@ def fetch_transactions(vendor_id: str, start: dt.date, end: dt.date):
                 continue
             r.raise_for_status()
             data = r.json()
-            items = _json_list_or_key(data, "transactions")
-            return items
+            # API sometimes returns a bare list or {"conversions":[...]}
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                items = data.get("conversions")
+                return items if isinstance(items, list) else []
+            return []
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             continue
-    print(f"[WARN] fetch_transactions failed on all endpoints: {last_err}")
+    print(f"[WARN] fetch_cloud_conversions failed on all endpoints: {last_err}")
     return []
 
-def debug_dump_transactions(items, prefix="[TX]"):
+
+def debug_dump_conversions(items, prefix="[CONV]"):
     """
-    Print compact lines for transactions so you can see what the API returns.
-    Safe to run in dry-run or prod; only logs to console.
+    Print compact lines for cloud conversions so you can see what the API returns.
     """
     def first(*vals):
         for v in vals:
@@ -99,21 +96,20 @@ def debug_dump_transactions(items, prefix="[TX]"):
         return None
 
     print(f"{prefix} total: {len(items)}")
-    for i, t in enumerate(items[:50], 1):  # cap output
-        # Dates appear as transactionDate / date / created
-        when = first(t.get("transactionDate"), t.get("date"), t.get("created"))
+    for i, c in enumerate(items[:100], 1):
+        when = first(c.get("conversionDate"), c.get("date"))
         if isinstance(when, str):
-            when = when[:19]  # YYYY-MM-DDTHH:MM:SS
-        ent  = first(t.get("appEntitlementNumber"), t.get("entitlementNumber"))
-        typ  = (first(t.get("transactionType"), t.get("eventType"), t.get("type")) or "").upper()
-        lic  = (first(t.get("licenseType"), t.get("license")) or "").title()
-        app  = first(t.get("addonName"), (t.get("app") or {}).get("name"), "Unknown app")
-        cust = first((t.get("contactDetails") or {}).get("company"),
-                     t.get("customer"), t.get("accountName"), "—")
-        amt  = first(t.get("amount"), t.get("price"))
-        cur  = first(t.get("currency"), t.get("currencyCode"))
-        amt_s = f" · {amt} {cur}" if amt and cur else ""
-        print(f"{prefix} {i:02d} • {when} • {app} • {typ}/{lic} • {cust} • {ent}{amt_s}")
+            when = when[:19]
+        ent  = first(c.get("appEntitlementNumber"), c.get("entitlementNumber"))
+        app  = first(c.get("addonName"), (c.get("app") or {}).get("name"), "Unknown app")
+        key  = first(c.get("addonKey"), (c.get("app") or {}).get("key"))
+        cust = first((c.get("contactDetails") or {}).get("company"),
+                     c.get("customer"), c.get("accountName"),
+                     c.get("cloudSiteHostname"), "—")
+        users = first(c.get("users"), c.get("seats"), c.get("quantity"))
+        users_s = f" · {users} users" if users else ""
+        print(f"{prefix} {i:02d} • {when} • {app} • {cust} • {ent}{users_s} • key={key}")
+
 
 def _extract_license_id(lic: dict):
     """Prefer the visible E-… entitlement; fall back to other ids/composite."""
@@ -520,9 +516,9 @@ def main():
 
     # Optional debug: show last 7 days of transactions in logs
     #if os.getenv("DEBUG_TX", "0") == "1":
-    tx_start = (end_date or start_date) - dt.timedelta(days=7)
-    tx_items = fetch_transactions(VENDOR_ID, tx_start, end_date or start_date)
-    debug_dump_transactions(tx_items)
+    week_start = (start_date or dt.date.today()) - dt.timedelta(days=7)
+    conv_items = fetch_cloud_conversions(VENDOR_ID, week_start, end_date or start_date)
+    debug_dump_conversions(conv_items)
 
     try:
         lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
