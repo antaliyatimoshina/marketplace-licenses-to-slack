@@ -520,9 +520,9 @@ def main():
 
     # Optional debug: show last 7 days of transactions in logs
     #if os.getenv("DEBUG_TX", "0") == "1":
-        tx_start = (end_date or start_date) - dt.timedelta(days=7)
-        tx_items = fetch_transactions(VENDOR_ID, tx_start, end_date or start_date)
-        debug_dump_transactions(tx_items)
+    tx_start = (end_date or start_date) - dt.timedelta(days=7)
+    tx_items = fetch_transactions(VENDOR_ID, tx_start, end_date or start_date)
+    debug_dump_transactions(tx_items)
 
     try:
         lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
