@@ -54,6 +54,21 @@ def infer_conversions_from_licenses(lic_items, target: dt.date):
         want.append(lic)
     return want
 
+def build_app_name_map(*payload_lists):
+    """
+    Build {addonKey -> addonName} from any Marketplace payload lists
+    (licenses, feedback/uninstalls, etc.).
+    """
+    m = {}
+    for plist in payload_lists:
+        for it in (plist or []):
+            app = it.get("app") or {}
+            key = it.get("addonKey") or app.get("key")
+            name = it.get("addonName") or app.get("name")
+            if key and name:
+                m[key] = name
+    return m
+
 def slack_post(payload: dict):
     """Post to Slack unless DRY_RUN=1, in which case just log."""
     if DRY_RUN:
@@ -719,12 +734,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        # make failures visible in logs (and optionally in Slack)
-        import traceback, os, requests
-        traceback.print_exc()
-        hook = os.getenv("SLACK_WEBHOOK")
-        if hook:
-            requests.post(hook, json={"text": f"❗ notify_licenses.py crashed: {e}"})
+    except Exception:
+        import traceback
+        traceback.print_exc()  # log to GitHub Actions logs only
         raise
-
