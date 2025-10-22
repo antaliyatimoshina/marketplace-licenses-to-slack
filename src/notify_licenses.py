@@ -42,6 +42,130 @@ APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.str
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
 
+def fetch_transactions(vendor_id: str, start: dt.date, end: dt.date):
+    """
+    Transactions async export:
+      1) POST initiate
+      2) poll status
+      3) download JSON
+    Returns a list of transaction dicts (or []).
+    """
+    import time, urllib.parse
+
+    base = "https://marketplace.atlassian.com"
+    # Try v2 then v4 (tenants differ)
+    init_urls = [
+        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions/async/export",
+        f"{base}/rest/4/vendors/{vendor_id}/reporting/transactions/async/export",
+    ]
+    qparams = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "accept": "json",
+        # UI often adds this; harmless if ignored:
+        "include": "zeroTransactions",
+    }
+    headers = {"Accept": "application/json"}
+
+    status_url = None
+    last_err = None
+
+    # 1) Initiate
+    for init in init_urls:
+        try:
+            r = requests.post(init, params=qparams, headers=headers,
+                              auth=(MP_USER, MP_API_TOKEN), timeout=60)
+            if r.status_code == 404:
+                last_err = f"404 on {r.url}"
+                continue
+            r.raise_for_status()
+            data = r.json() if r.content else {}
+            export_id = (
+                data.get("exportId")
+                or data.get("id")
+                or (data.get("links") or {}).get("self", "").split("/")[-1]
+            )
+            status_url = (
+                data.get("statusUrl")
+                or (data.get("links") or {}).get("status")
+                or (f"{init}/{urllib.parse.quote(str(export_id))}/status" if export_id else None)
+            )
+            if status_url:
+                break
+            last_err = f"unexpected initiate response on {init}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e} on {init}"
+            continue
+
+    if not status_url:
+        print(f"[WARN] transactions initiate failed: {last_err}")
+        return []
+
+    # 2) Poll status (up to ~60s)
+    deadline = time.time() + 60
+    download_url = None
+    while time.time() < deadline:
+        rs = requests.get(status_url, headers=headers, auth=(MP_USER, MP_API_TOKEN), timeout=60)
+        if rs.status_code == 404:
+            time.sleep(2)
+            continue
+        rs.raise_for_status()
+        sdata = rs.json() if rs.content else {}
+        state = (sdata.get("state") or sdata.get("status") or "").lower()
+        download_url = sdata.get("downloadUrl") or sdata.get("resultUrl")
+        if state in ("completed", "complete", "done") and download_url:
+            break
+        if state in ("failed", "error"):
+            print(f"[WARN] transactions export failed: {sdata}")
+            return []
+        time.sleep(2)
+
+    if not download_url:
+        print("[WARN] transactions export timed out without downloadUrl")
+        return []
+
+    # 3) Download JSON
+    rd = requests.get(download_url, headers=headers, auth=(MP_USER, MP_API_TOKEN), timeout=120)
+    rd.raise_for_status()
+    try:
+        payload = rd.json()
+    except Exception:
+        print("[WARN] transactions export is not JSON; first 200 chars:")
+        print(rd.text[:200])
+        return []
+
+    # Normalize list
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("transactions"), list):
+        return payload["transactions"]
+    return []
+
+def debug_dump_transactions(items, prefix="[TX]"):
+    def first(*vals):
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if v not in (None, "", [], {}):
+                return v
+        return None
+
+    print(f"{prefix} total: {len(items)}")
+    for i, t in enumerate(items[:50], 1):
+        when = first(t.get("transactionDate"), t.get("date"), t.get("created"))
+        if isinstance(when, str): when = when[:19]
+        ent  = first(t.get("appEntitlementNumber"), t.get("entitlementNumber"))
+        typ  = (first(t.get("transactionType"), t.get("eventType"), t.get("type")) or "").upper()
+        lic  = (first(t.get("licenseType"), t.get("license")) or "").title()
+        app  = first(t.get("addonName"), (t.get("app") or {}).get("name"), "Unknown app")
+        cust = first((t.get("contactDetails") or {}).get("company"), t.get("customer"), t.get("accountName"), "—")
+        users= first(t.get("users"), t.get("quantity"), t.get("seats"))
+        amt  = first(t.get("amount"), t.get("price")); cur = first(t.get("currency"), t.get("currencyCode"))
+        amt_s = f" · {amt} {cur}" if amt and cur else ""
+        users_s = f" · {users} users" if users else ""
+        print(f"{prefix} {i:02d} • {when} • {app} • {typ}/{lic}{users_s} • {cust} • {ent}{amt_s}")
+
+
 def fetch_cloud_conversions(vendor_id: str, start: dt.date, end: dt.date):
     """
     Transactions for a date window (UTC).
@@ -526,9 +650,9 @@ def main():
 
     # Optional debug: show last 7 days of transactions in logs
     #if os.getenv("DEBUG_TX", "0") == "1":
-    week_start = (start_date or dt.date.today()) - dt.timedelta(days=7)
-    conv_items = fetch_cloud_conversions(VENDOR_ID, week_start, end_date or start_date)
-    debug_dump_conversions(conv_items)
+    week_start = (start_date - dt.timedelta(days=7))
+    tx_items = fetch_transactions(VENDOR_ID, week_start, end_date or start_date)
+    debug_dump_transactions(tx_items)
 
     try:
         lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
