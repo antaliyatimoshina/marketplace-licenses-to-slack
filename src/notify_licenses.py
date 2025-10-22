@@ -42,6 +42,79 @@ APPS_FILTER   = set([a.strip() for a in os.getenv("APPS","").split(",") if a.str
 # Date window (UTC)
 today_utc = dt.datetime.utcnow().date()
 
+def _json_list_or_key(data, key):
+    """Marketplace sometimes returns a list, sometimes {'key': [...]}."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        v = data.get(key)
+        return v if isinstance(v, list) else []
+    return []
+
+def fetch_transactions(vendor_id: str, start: dt.date, end: dt.date):
+    """
+    Transactions for a date window (UTC).
+    Tries both /export and base endpoint, normalizes to a list.
+    """
+    base = "https://marketplace.atlassian.com"
+    endpoints = [
+        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions/export",
+        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions",
+    ]
+    params = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "accept": "json",
+    }
+    headers = {"Accept": "application/json"}
+    last_err = None
+    for url in endpoints:
+        try:
+            r = requests.get(url, params=params, headers=headers,
+                             auth=(MP_USER, MP_API_TOKEN), timeout=60)
+            if r.status_code == 404:
+                last_err = f"404 on {url}"
+                continue
+            r.raise_for_status()
+            data = r.json()
+            items = _json_list_or_key(data, "transactions")
+            return items
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+    print(f"[WARN] fetch_transactions failed on all endpoints: {last_err}")
+    return []
+
+def debug_dump_transactions(items, prefix="[TX]"):
+    """
+    Print compact lines for transactions so you can see what the API returns.
+    Safe to run in dry-run or prod; only logs to console.
+    """
+    def first(*vals):
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if v not in (None, "", [], {}):
+                return v
+        return None
+
+    print(f"{prefix} total: {len(items)}")
+    for i, t in enumerate(items[:50], 1):  # cap output
+        # Dates appear as transactionDate / date / created
+        when = first(t.get("transactionDate"), t.get("date"), t.get("created"))
+        if isinstance(when, str):
+            when = when[:19]  # YYYY-MM-DDTHH:MM:SS
+        ent  = first(t.get("appEntitlementNumber"), t.get("entitlementNumber"))
+        typ  = (first(t.get("transactionType"), t.get("eventType"), t.get("type")) or "").upper()
+        lic  = (first(t.get("licenseType"), t.get("license")) or "").title()
+        app  = first(t.get("addonName"), (t.get("app") or {}).get("name"), "Unknown app")
+        cust = first((t.get("contactDetails") or {}).get("company"),
+                     t.get("customer"), t.get("accountName"), "—")
+        amt  = first(t.get("amount"), t.get("price"))
+        cur  = first(t.get("currency"), t.get("currencyCode"))
+        amt_s = f" · {amt} {cur}" if amt and cur else ""
+        print(f"{prefix} {i:02d} • {when} • {app} • {typ}/{lic} • {cust} • {ent}{amt_s}")
+
 def _extract_license_id(lic: dict):
     """Prefer the visible E-… entitlement; fall back to other ids/composite."""
     def _first(*vals):
@@ -441,8 +514,15 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
     print("Posted combined message (merged by appKey).")
 
 def main():
+
     start_date, end_date = day_window_utc()
     print(f"[INFO] Daily window (UTC): {start_date}")
+
+    # Optional debug: show last 7 days of transactions in logs
+    #if os.getenv("DEBUG_TX", "0") == "1":
+        tx_start = (end_date or start_date) - dt.timedelta(days=7)
+        tx_items = fetch_transactions(VENDOR_ID, tx_start, end_date or start_date)
+        debug_dump_transactions(tx_items)
 
     try:
         lic_items = fetch_licenses(VENDOR_ID, start_date, end_date)
