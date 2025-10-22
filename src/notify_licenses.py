@@ -54,6 +54,34 @@ def infer_conversions_from_licenses(lic_items, target: dt.date):
         want.append(lic)
     return want
 
+def build_entitlement_enrichment(*license_lists):
+    """
+    From licenses payloads, build a dict:
+      { entitlementNumber -> {"customer": ..., "contactName": ..., "contactEmail": ...} }
+    Uses contactDetails (technical/billing) and company when available.
+    """
+    out = {}
+    for lst in license_lists:
+        for lic in (lst or []):
+            ent = lic.get("appEntitlementNumber") or lic.get("hostEntitlementNumber")
+            if not ent:
+                continue
+            cd = lic.get("contactDetails") or {}
+            comp = cd.get("company") or lic.get("customer") or lic.get("cloudSiteHostname") or "—"
+
+            # prefer technical contact, then billing
+            t = cd.get("technicalContact") or {}
+            b = cd.get("billingContact") or {}
+            name  = t.get("name")  or b.get("name")
+            email = t.get("email") or b.get("email")
+
+            out[ent] = {
+                "customer": comp,
+                "contactName": name,
+                "contactEmail": email,
+            }
+    return out
+
 def build_app_name_map(*payload_lists):
     """
     Build {addonKey -> addonName} from any Marketplace payload lists
@@ -507,75 +535,54 @@ def fetch_uninstalls(vendor_id: str, start: dt.date, end: dt.date):
         return data.get("feedback", []) or data.get("items", []) or []
     return []
 
-def pick_uninstalls(items, name_map=None):
+def pick_uninstalls(items, name_map=None, ent_map=None):
     """
-    Map feedback items (uninstall/unsubscribe/disable) to rows for Slack:
-      • {customerOrSiteOrId} · {contactName} ({email}) · {TYPE}
-    Includes:
-      - app     : pretty name (addonName → name_map[addonKey] → addonKey)
-      - appKey  : canonical key for grouping with license rows
-      - licenseId: best available entitlement/license id (E-… preferred)
+    Map Feedback/Uninstall/Unsubscribe rows to the common row shape,
+    enriching missing customer/contact from licenses using entitlement id.
     """
-    import uuid
-
-    def first(*vals):
-        for v in vals:
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-            if v not in (None, "", [], {}):
-                return v
-        return None
-
-    def is_uuidlike(s):
-        try:
-            uuid.UUID(str(s))
-            return True
-        except Exception:
-            return False
-
-    def domain(email):
-        return email.split("@", 1)[1] if isinstance(email, str) and "@" in email else None
-
-    rows = []
+    out = []
     for f in (items or []):
-        key = first(f.get("addonKey"), (f.get("app") or {}).get("key"))
-        app_name = first(f.get("addonName"), (name_map or {}).get(key), key, "Unknown app")
-        app_key_expr = key or app_name
+        app = f.get("app") or {}
+        app_name = f.get("addonName") or app.get("name")
+        app_key  = f.get("addonKey")  or app.get("key")
 
-        ftype = (f.get("feedbackType") or "").upper()  # UNINSTALL / UNSUBSCRIBE / DISABLE
-        email = f.get("email")
-        name  = f.get("fullName")
-        site  = first(f.get("cloudSiteHostname"), (None if is_uuidlike(f.get("cloudId")) else f.get("cloudId")))
+        # raw fields from feedback payload
+        cust   = (f.get("contactDetails") or {}).get("company") or f.get("customer") or "Unknown"
+        name   = f.get("contactName")
+        email  = f.get("contactEmail")
+        ftype  = (f.get("feedbackType") or "").upper()  # UNSUBSCRIBE / UNINSTALL / DISABLE
+        ent_id = f.get("appEntitlementNumber") or f.get("entitlementNumber")
 
-        # Best visible ID(s)
-        license_id = first(
-            f.get("appEntitlementNumber"),
-            f.get("licenseId"),
-            f.get("hostEntitlementNumber"),
-            f.get("appEntitlementId"),
-            f.get("hostEntitlementId"),
-        )
+        # enrichment from licenses by entitlement number
+        if ent_map and ent_id:
+            info = ent_map.get(ent_id)
+            if info:
+                if cust in ("Unknown", "—") or not cust:
+                    cust = info.get("customer") or cust
+                if not name:
+                    name = info.get("contactName")
+                if not email:
+                    email = info.get("contactEmail")
 
-        # Customer fallback chain: hostname → email domain → entitlement → short cloudId → Unknown
-        cust = first(
-            site,
-            domain(email),
-            license_id,
-            (str(f.get("cloudId"))[:8] + "…" if f.get("cloudId") else None),
-            "Unknown",
-        )
+        # human labels (optional)
+        ACTION_LABELS = {
+            "UNSUBSCRIBE": "UNSUBSCRIBE",
+            "UNINSTALL": "UNINSTALL",
+            "DISABLE": "DISABLE",
+        }
+        label = ACTION_LABELS.get(ftype, ftype or "UNSUBSCRIBE")
 
-        rows.append({
-            "app": app_name,
-            "appKey": app_key_expr,
-            "customer": cust,
+        out.append({
+            "app": app_name or (name_map or {}).get(app_key) or app_key or "Unknown app",
+            "appKey": app_key or app_name,
+            "customer": cust or "—",
             "contactName": name,
             "contactEmail": email,
-            "licenseType": ftype,
+            "licenseType": label,
             "users": None,
-            "licenseId": license_id,
+            "licenseId": ent_id,
         })
-    return rows
+    return out
 
 def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date):
     """
@@ -691,6 +698,8 @@ def main():
     # 2a) Wide fetch for conversion inference (uses lastUpdated on the target date)
     wide_start = start_date - dt.timedelta(days=CONVERSION_LOOKBACK_DAYS)
     lic_items_wide = fetch_licenses(VENDOR_ID, wide_start, end_date)   # existing function
+    # build entitlement -> customer/contact enrichment
+    ent_map = build_entitlement_enrichment(lic_items_wide)
 
     inferred_raw = infer_conversions_from_licenses(lic_items_wide, start_date)
     conv_rows = pick_new_evaluations(inferred_raw, start_date, end_date)  # reuse your mapper
@@ -715,7 +724,7 @@ def main():
     # 2c) Uninstalls (your existing path)
     un_items = fetch_uninstalls(VENDOR_ID, start_date, end_date)
     name_map = build_app_name_map(lic_items, un_items)
-    un_rows  = pick_uninstalls(un_items, name_map=name_map)
+    un_rows   = pick_uninstalls(un_items, name_map=name_map, ent_map=ent_map)
 
     # 2d) Merge conversions + de-dupe by licenseId so they don’t also appear under New licenses
     seen_ids = {r.get("licenseId") for r in conv_rows if r.get("licenseId")}
