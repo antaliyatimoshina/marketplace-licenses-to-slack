@@ -465,11 +465,25 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
         # Type & users
         license_id = _extract_license_id(lic)
         license_type = (lic.get("licenseType") or lic.get("tier") or "LICENSE").upper()
+
+        # Evaluation insights: potential number of users for trials
+        trial_user_count = None
+        raw_eval_size = lic.get("evaluationOpportunitySize")
+        if isinstance(raw_eval_size, str):
+            if raw_eval_size.isdigit():
+                trial_user_count = int(raw_eval_size)
+        elif isinstance(raw_eval_size, (int, float)):
+            try:
+                trial_user_count = int(raw_eval_size)
+            except (TypeError, ValueError):
+                trial_user_count = None
+
         users = None
         if isinstance(lic.get("tier"), str):
             m = re.search(r"(\d+)\s*Users?", lic["tier"], re.I)
             if m:
                 users = int(m.group(1))
+
 
         # Best visible ID
         license_id = first(
@@ -506,6 +520,8 @@ def pick_new_evaluations(items, date_from: dt.date, date_to: dt.date):
             "licenseId": license_id,
             "isConversion": bool(is_conversion),
             "trialStarted": trial_dt.isoformat() if trial_dt else None,
+            "trial_user_count": trial_user_count if license_type in ("EVALUATION", "EVAL", "TRIAL") else None,
+
         })
 
     return rows
@@ -666,10 +682,17 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                     if e.get("contactName") and e.get("contactEmail")
                     else (e.get("contactName") or e.get("contactEmail") or "—")
                 )
-                users_part = f" · {e['users']} users" if e.get("users") else ""
+                trial_users = e.get("trial_user_count")
+                if trial_users and e.get("licenseType") in ("EVALUATION", "EVAL", "TRIAL"):
+                    # For trials: show "10 users" based on evaluationOpportunitySize
+                    users_part = f" · {trial_users} users"
+                else:
+                    # For paid licenses: keep existing users count from tier
+                    users_part = f" · {e['users']} users" if e.get("users") else ""
                 id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
             section_chunks.append(":airplane: New licenses\n" + "\n".join(lines))
+
     
         # Uninstalls / Unsubscribes (keep your existing loop, but you can add same-day reinstall flag)
         if un_rows:
