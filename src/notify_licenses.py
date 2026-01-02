@@ -568,6 +568,7 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
         email  = f.get("contactEmail")
         ftype  = (f.get("feedbackType") or "").upper()  # UNSUBSCRIBE / UNINSTALL / DISABLE
         ent_id = f.get("appEntitlementNumber") or f.get("entitlementNumber")
+        users  = f.get("users") or f.get("seats") or f.get("quantity")
 
         # enrichment from licenses by entitlement number
         if ent_map and ent_id:
@@ -595,7 +596,7 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
             "contactName": name,
             "contactEmail": email,
             "licenseType": label,
-            "users": None,
+            "users": users,
             "licenseId": ent_id,
         })
     return out
@@ -703,12 +704,19 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                     if e.get("contactName") and e.get("contactEmail")
                     else (e.get("contactName") or e.get("contactEmail") or "—")
                 )
+                users_part = f" · {e['users']} users" if e.get("users") else ""
                 id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""
                 reinst_part = " (same-day reinstall)" if e.get("licenseId") in reinstalled_ids else ""
-                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{id_part}{reinst_part}")
+                lines.append(
+                    f"• {e['customer']} · {contact} · {e['licenseType']}"
+                    f"{users_part}{id_part}{reinst_part}"
+                )
             section_chunks.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
 
-    parts.append(f"{app_title} Marketplace Events ({date_label}, UTC)\n\n" + "\n\n".join(section_chunks))
+        parts.append(
+            f"{app_title} Marketplace Events ({date_label}, UTC)\n\n"
+            + "\n\n".join(section_chunks)
+        )
 
     text = "\n\n".join(parts)
     slack_post({"text": text})
