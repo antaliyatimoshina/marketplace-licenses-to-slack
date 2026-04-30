@@ -1020,5 +1020,5 @@ if __name__ == "__main__":
         main()
     except Exception:
         import traceback
-        traceback.print_exc()  # log to GitHub Actions logs only
+        traceback.print_exc()  # log to GitHub Actions logs
         raise
