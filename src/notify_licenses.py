@@ -34,6 +34,12 @@ DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 # safe default; can still be overridden via env.
 CONVERSION_LOOKBACK_DAYS = int(os.getenv("CONVERSION_LOOKBACK_DAYS", "90"))
 
+# Atlassian's pricing model gives 1-10 users for free, so renewals at that
+# tier don't generate revenue and aren't worth posting. Only renewals at or
+# above this user count are kept in the License renewals section. Override
+# via env if Atlassian changes the free-tier limit.
+PAID_RENEWAL_MIN_USERS = int(os.getenv("PAID_RENEWAL_MIN_USERS", "11"))
+
 def _iso10(s):
     return (s or "")[:10] if isinstance(s, str) else None
 
@@ -706,6 +712,18 @@ def pick_renewals(tx_items, day: dt.date, name_map=None, ent_map=None):
                 if m:
                     users = int(m.group(1))
 
+        # Filter to paid renewals only. Atlassian's free tier covers 1-10
+        # users; below the threshold we drop the row. We also drop rows
+        # where user count is unknown — without it we can't tell paid from
+        # free, and erring on the side of fewer false positives is safer
+        # than spamming the channel with free-tier "renewals".
+        try:
+            users_int = int(users) if users is not None else None
+        except (TypeError, ValueError):
+            users_int = None
+        if users_int is None or users_int < PAID_RENEWAL_MIN_USERS:
+            continue
+
         license_type = (pd.get("licenseType") or tx.get("licenseType") or "COMMERCIAL").upper()
 
         rows.append({
@@ -890,7 +908,7 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                 users_part = f" · {e['users']} users" if e.get("users") else ""
                 id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
-            section_chunks.append(":arrows_counterclockwise: License renewals\n" + "\n".join(lines))
+            section_chunks.append(":arrows_counterclockwise: Paid renewals\n" + "\n".join(lines))
 
         # Uninstalls / Unsubscribes — only true churn (same-day "reinstalls"
         # already filtered out above).
