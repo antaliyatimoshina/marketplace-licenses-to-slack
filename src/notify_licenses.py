@@ -28,7 +28,11 @@ VENDOR_ID     = env("VENDOR_ID", required=True)
 SLACK_WEBHOOK = env("SLACK_WEBHOOK", required=True)
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
-CONVERSION_LOOKBACK_DAYS = int(os.getenv("CONVERSION_LOOKBACK_DAYS", "60"))
+# How far back (in days) the "wide fetch" looks when inferring trial→paid
+# conversions. Must comfortably exceed Atlassian's max trial length, since
+# the commercial license inherits the trial's maintenanceStartDate. 90 is a
+# safe default; can still be overridden via env.
+CONVERSION_LOOKBACK_DAYS = int(os.getenv("CONVERSION_LOOKBACK_DAYS", "90"))
 
 def _iso10(s):
     return (s or "")[:10] if isinstance(s, str) else None
@@ -238,13 +242,34 @@ def debug_dump_transactions(items, prefix="[TX]"):
 def fetch_cloud_conversions(vendor_id: str, start: dt.date, end: dt.date):
     """
     Transactions for a date window (UTC).
-    Tries export/base endpoints, first with include=zeroTransactions, then without.
-    Normalizes to a list.
+    Tries a comprehensive set of endpoint shapes (paths under /reporting/ and
+    /reporting/sales/, sync GET on /export and bare resource, plus GET on
+    /async/export which on some tenants returns synchronously). Logs the
+    outcome of every attempt so a failure is debuggable without re-running.
     """
     base = "https://marketplace.atlassian.com"
+    # Endpoint paths to try, in priority order.
+    # The /sales/transactions/ variants exist because Atlassian's Reports UI
+    # groups transactions under "Sales" — some tenants only respond on that
+    # path, others only on the bare /transactions path.
+    paths = [
+        # sync export endpoints (most likely to work)
+        "/reporting/transactions/export",
+        "/reporting/sales/transactions/export",
+        # bare resource endpoints
+        "/reporting/transactions",
+        "/reporting/sales/transactions",
+        # async/export accessed via GET (POST returns 405 on this tenant,
+        # which strongly hints GET is the intended method on some flavours)
+        "/reporting/transactions/async/export",
+        "/reporting/sales/transactions/async/export",
+    ]
+    # Try v2 first (matches what licenses uses on this tenant), then v4.
+    versions = ["2", "4"]
     endpoints = [
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions/export",
-        f"{base}/rest/2/vendors/{vendor_id}/reporting/transactions",
+        f"{base}/rest/{v}/vendors/{vendor_id}{p}"
+        for v in versions
+        for p in paths
     ]
     # try with and without the include=zeroTransactions switch the UI uses
     param_variants = [
@@ -252,38 +277,60 @@ def fetch_cloud_conversions(vendor_id: str, start: dt.date, end: dt.date):
         {"startDate": start.isoformat(), "endDate": end.isoformat(), "accept": "json"},
     ]
     headers = {"Accept": "application/json"}
-    last_err = None
+    attempts = []  # list of (status, url, note) — printed on failure
 
     for url in endpoints:
         for params in param_variants:
             try:
                 r = requests.get(url, params=params, headers=headers,
                                  auth=(MP_USER, MP_API_TOKEN), timeout=60)
-                # Some tenants return 404 on one variant but not the other
-                if r.status_code == 404:
-                    last_err = f"404 on {r.url}"
+                status = r.status_code
+                # Hard-skip statuses
+                if status in (404, 405):
+                    attempts.append((status, r.url, "skipped"))
                     continue
-                # 204/empty bodies → keep trying next variant
-                if r.status_code == 204 or not r.content:
-                    last_err = f"{r.status_code} no content on {r.url}"
+                if status == 204 or not r.content:
+                    attempts.append((status, r.url, "no content"))
+                    continue
+                if status >= 400:
+                    body = (r.text or "")[:120].replace("\n", " ")
+                    attempts.append((status, r.url, f"error body={body!r}"))
                     continue
 
-                r.raise_for_status()
+                # Some endpoints return CSV when accept=json is ignored. Detect.
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if "json" not in ct and not r.text.lstrip().startswith(("[", "{")):
+                    attempts.append((status, r.url, f"non-JSON content-type={ct}"))
+                    continue
+
                 data = r.json()
-                # API sometimes returns a list or {"transactions":[...]}
                 if isinstance(data, list):
+                    print(f"[INFO] transactions: {url} → {len(data)} item(s)")
                     return data
                 if isinstance(data, dict):
-                    items = data.get("transactions")
-                    if isinstance(items, list):
-                        return items
-                # fall through to try next variant
-                last_err = f"unexpected JSON on {r.url}"
+                    for k in ("transactions", "items", "data", "results", "values"):
+                        items = data.get(k)
+                        if isinstance(items, list):
+                            print(f"[INFO] transactions: {url} → {len(items)} item(s) (under '{k}')")
+                            return items
+                    attempts.append((status, r.url, f"unexpected JSON keys={list(data.keys())}"))
+                    continue
+                attempts.append((status, r.url, f"unexpected type={type(data).__name__}"))
             except Exception as e:
-                last_err = f"{type(e).__name__}: {e} on {url}"
+                attempts.append(("EXC", url, f"{type(e).__name__}: {e}"))
                 continue
 
-    print(f"[WARN] fetch_transactions failed on all attempts: {last_err}")
+    print("[WARN] fetch_transactions failed on all attempts. Attempt log:")
+    # Deduplicate identical (status, path) entries so the log isn't 12 lines of "404"
+    seen = set()
+    for status, url, note in attempts:
+        # strip query string for compactness
+        path_only = url.split("?", 1)[0]
+        key = (status, path_only)
+        if key in seen:
+            continue
+        seen.add(key)
+        print(f"  {status:>5}  {path_only}  {note}")
     return []
 
 def debug_dump_conversions(items, prefix="[CONV]"):
@@ -331,8 +378,6 @@ def _extract_license_id(lic: dict):
         (f"{lic.get('addonKey')}::{lic.get('cloudId')}"
          if lic.get("addonKey") and lic.get("cloudId") else None),
     )
-
-CONVERSION_LOOKBACK_DAYS = int(os.getenv("CONVERSION_LOOKBACK_DAYS", "45"))
 
 def _parse_date(s: str | None):
     if not s:
@@ -551,6 +596,131 @@ def fetch_uninstalls(vendor_id: str, start: dt.date, end: dt.date):
         return data.get("feedback", []) or data.get("items", []) or []
     return []
 
+def pick_renewals(tx_items, day: dt.date, name_map=None, ent_map=None):
+    """
+    From a transactions payload, pick rows where saleType == 'Renewal'
+    on the given UTC day. Returns rows with the same shape as license rows
+    so they can flow through the existing Slack rendering.
+
+    Atlassian Marketplace transactions typically expose:
+      - purchaseDetails.saleType ('New' | 'Renewal' | 'Upgrade' | 'Refund')
+      - purchaseDetails.licenseType, tier, maintenanceStartDate
+      - customerDetails.company / technicalContact / billingContact
+      - appEntitlementNumber, addonKey, addonName, transactionDate/saleDate
+    """
+    import re
+
+    def first(*vals):
+        for v in vals:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if v not in (None, "", [], {}):
+                return v
+        return None
+
+    target = day.isoformat()
+    rows = []
+    for tx in (tx_items or []):
+        pd = tx.get("purchaseDetails") or {}
+
+        # saleType lives under purchaseDetails on most tenants, but be defensive
+        sale = (
+            pd.get("saleType")
+            or tx.get("saleType")
+            or tx.get("transactionType")
+            or ""
+        ).strip().lower()
+        if sale != "renewal":
+            continue
+
+        # Filter to the target date — try a few common date fields
+        when = first(
+            tx.get("saleDate"),
+            pd.get("saleDate"),
+            tx.get("transactionDate"),
+            pd.get("maintenanceStartDate"),
+            tx.get("date"),
+        )
+        if isinstance(when, str):
+            when = when[:10]
+        if when and when != target:
+            continue
+
+        # App identifiers
+        app = tx.get("app") or {}
+        app_name = first(tx.get("addonName"), app.get("name"), "Unknown app")
+        app_key = first(tx.get("addonKey"), app.get("key"), app_name)
+
+        # Customer / contact (transactions sometimes use customerDetails, sometimes contactDetails)
+        cd = tx.get("customerDetails") or tx.get("contactDetails") or {}
+        tech = cd.get("technicalContact") or {}
+        bill = cd.get("billingContact") or {}
+        company = first(
+            cd.get("company"),
+            tx.get("customer"),
+            tx.get("accountName"),
+            tx.get("cloudSiteHostname"),
+            "—",
+        )
+        contact_name = first(tech.get("name"), bill.get("name"))
+        contact_email = first(tech.get("email"), bill.get("email"))
+
+        # Atlassian's transaction payload sometimes fills `company` and the
+        # contact `name` with the contact email when no real values are set
+        # (rendering as "email · email (email)"). Treat those as missing so
+        # the ent_map license enrichment below can supply a real company name
+        # and contact name from the matching license record.
+        if (isinstance(company, str) and contact_email and
+                company.strip().lower() == contact_email.strip().lower()):
+            company = "—"
+        if (isinstance(contact_name, str) and contact_email and
+                contact_name.strip().lower() == contact_email.strip().lower()):
+            contact_name = None
+
+        # Entitlement id — fallback to license enrichment map for missing fields
+        ent_id = first(
+            tx.get("appEntitlementNumber"),
+            tx.get("entitlementNumber"),
+            pd.get("appEntitlementNumber"),
+        )
+        if ent_map and ent_id:
+            info = ent_map.get(ent_id) or {}
+            if company in (None, "", "—", "Unknown"):
+                company = info.get("customer") or company
+            if not contact_name:
+                contact_name = info.get("contactName")
+            if not contact_email:
+                contact_email = info.get("contactEmail")
+
+        # Users — parse from tier string when available
+        users = first(
+            tx.get("users"),
+            tx.get("quantity"),
+            tx.get("seats"),
+            pd.get("users"),
+        )
+        if users is None:
+            tier = pd.get("tier") or tx.get("tier") or ""
+            if isinstance(tier, str):
+                m = re.search(r"(\d+)\s*Users?", tier, re.I)
+                if m:
+                    users = int(m.group(1))
+
+        license_type = (pd.get("licenseType") or tx.get("licenseType") or "COMMERCIAL").upper()
+
+        rows.append({
+            "app": app_name or (name_map or {}).get(app_key) or app_key or "Unknown app",
+            "appKey": app_key,
+            "customer": company,
+            "contactName": contact_name,
+            "contactEmail": contact_email,
+            "licenseType": license_type,
+            "users": users,
+            "licenseId": ent_id,
+            "isRenewal": True,
+        })
+    return rows
+
 def pick_uninstalls(items, name_map=None, ent_map=None):
     """
     Map Feedback/Uninstall/Unsubscribe rows to the common row shape,
@@ -601,35 +771,41 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
         })
     return out
 
-def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date):
+def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date, renewal_rows=None):
     """
     One message per appKey:
       {Pretty App Name} Marketplace Events (YYYY-MM-DD, UTC)
 
+    💰 Conversions (trial → paid)
     ✈️ New licenses
-    • customer · Name (email) · TYPE [· N users] [· E-...]
-    
+    🔄 License renewals
     ➖ Uninstalls / Unsubscribes
-    • customer/site · Name (email) · TYPE [· E-...]
     """
     # Group by canonical key
     groups = {}
     for r in (licenses_rows or []):
         k = r.get("appKey") or r.get("app") or "unknown"
-        g = groups.setdefault(k, {"names": set(), "lic": [], "un": []})
+        g = groups.setdefault(k, {"names": set(), "lic": [], "renew": [], "un": []})
         if r.get("app"):
             g["names"].add(r["app"])
         g["lic"].append(r)
 
+    for r in (renewal_rows or []):
+        k = r.get("appKey") or r.get("app") or "unknown"
+        g = groups.setdefault(k, {"names": set(), "lic": [], "renew": [], "un": []})
+        if r.get("app"):
+            g["names"].add(r["app"])
+        g["renew"].append(r)
+
     for r in (uninstall_rows or []):
         k = r.get("appKey") or r.get("app") or "unknown"
-        g = groups.setdefault(k, {"names": set(), "lic": [], "un": []})
+        g = groups.setdefault(k, {"names": set(), "lic": [], "renew": [], "un": []})
         if r.get("app"):
             g["names"].add(r["app"])
         g["un"].append(r)
 
     if not groups:
-        slack_post({"text": f"ℹ️ No new licenses or uninstalls for {start.isoformat()} (UTC)."})
+        slack_post({"text": f"ℹ️ No new licenses, renewals or uninstalls for {start.isoformat()} (UTC)."})
         print("Nothing to post.")
         return
 
@@ -650,14 +826,22 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
     
         # app-scoped rows
         lic_rows = g["lic"]
+        renew_rows = g["renew"]
         un_rows  = g["un"]
     
         # 1) split licenses into conversions vs non-conversions
         paid_conversions = [e for e in lic_rows if e.get("isConversion")]
         new_nonconversion = [e for e in lic_rows if not e.get("isConversion")]
-    
-        # (optional) same-day reinstall marker
-        reinstalled_ids = {e["licenseId"] for e in lic_rows if e.get("licenseId")}
+
+        # 2) suppress "false" uninstalls — if an entitlement also appears in
+        # licenses or renewals for the same day, the unsubscribe event is
+        # almost always API/state churn (e.g. trial entitlement winding down
+        # as the new commercial one starts, or convert+cancel same day),
+        # not a real reinstall. Only show truly churning entitlements.
+        active_ids = {
+            e["licenseId"] for e in (lic_rows + renew_rows) if e.get("licenseId")
+        }
+        un_rows = [e for e in un_rows if e.get("licenseId") not in active_ids]
     
         # Conversions
         if paid_conversions:
@@ -694,8 +878,22 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                 lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
             section_chunks.append(":airplane: New licenses\n" + "\n".join(lines))
 
-    
-        # Uninstalls / Unsubscribes (keep your existing loop, but you can add same-day reinstall flag)
+        # License renewals (sourced from transactions where saleType == "Renewal")
+        if renew_rows:
+            lines = []
+            for e in renew_rows:
+                contact = (
+                    f"{e['contactName']} ({e['contactEmail']})"
+                    if e.get("contactName") and e.get("contactEmail")
+                    else (e.get("contactName") or e.get("contactEmail") or "—")
+                )
+                users_part = f" · {e['users']} users" if e.get("users") else ""
+                id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
+                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
+            section_chunks.append(":arrows_counterclockwise: License renewals\n" + "\n".join(lines))
+
+        # Uninstalls / Unsubscribes — only true churn (same-day "reinstalls"
+        # already filtered out above).
         if un_rows:
             lines = []
             for e in un_rows:
@@ -706,17 +904,26 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                 )
                 users_part = f" · {e['users']} users" if e.get("users") else ""
                 id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""
-                reinst_part = " (same-day reinstall)" if e.get("licenseId") in reinstalled_ids else ""
                 lines.append(
                     f"• {e['customer']} · {contact} · {e['licenseType']}"
-                    f"{users_part}{id_part}{reinst_part}"
+                    f"{users_part}{id_part}"
                 )
             section_chunks.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
+
+        # Skip apps whose only events were filtered out (e.g. "false" uninstalls
+        # that turned out to be conversions/renewals on the same day).
+        if not section_chunks:
+            continue
 
         parts.append(
             f"{app_title} Marketplace Events ({date_label}, UTC)\n\n"
             + "\n\n".join(section_chunks)
         )
+
+    if not parts:
+        slack_post({"text": f"ℹ️ No new licenses, renewals or uninstalls for {start.isoformat()} (UTC)."})
+        print("All events filtered as same-day churn; posted 'no changes'.")
+        return
 
     text = "\n\n".join(parts)
     slack_post({"text": text})
@@ -757,19 +964,56 @@ def main():
     name_map = build_app_name_map(lic_items, un_items)
     un_rows   = pick_uninstalls(un_items, name_map=name_map, ent_map=ent_map)
 
+    # 2c-bis) Renewals — sourced from transactions, where saleType == "Renewal".
+    # fetch_cloud_conversions tries multiple GET endpoint shapes; the path that
+    # works on this tenant is /reporting/sales/transactions/export.
+    tx_items = fetch_cloud_conversions(VENDOR_ID, start_date, end_date)
+    renew_rows = pick_renewals(tx_items, start_date, name_map=name_map, ent_map=ent_map)
+
     # 2d) Merge conversions + de-dupe by licenseId so they don’t also appear under New licenses
     seen_ids = {r.get("licenseId") for r in conv_rows if r.get("licenseId")}
     lic_rows_filtered = [r for r in lic_rows if r.get("licenseId") not in seen_ids]
     lic_rows_final = conv_rows + lic_rows_filtered
 
-    print(f"[INFO] Licenses mapped: {len(lic_rows_final)} | Conversions inferred: {len(conv_rows)} | Uninstalls mapped: {len(un_rows)}")
+    # If a renewal entitlement also surfaced in the licenses feed (rare but possible
+    # on continuous renewals where maintenanceStartDate ticks forward), prefer the
+    # renewal section and drop it from "New licenses" to avoid double-counting.
+    renew_ids = {r.get("licenseId") for r in renew_rows if r.get("licenseId")}
+    if renew_ids:
+        lic_rows_final = [r for r in lic_rows_final if r.get("licenseId") not in renew_ids]
 
-    if not lic_rows_final and not un_rows:
-        slack_post({"text": f"ℹ️ No new licenses or uninstalls for {start_date} (UTC)."})
+    # Cross-feed conflict resolution.
+    # An entitlement that appears in BOTH the licenses/conversions feed AND the
+    # uninstalls feed for the same UTC day is almost always `lastUpdated` drift —
+    # the unsubscribe event re-touched the license record, which then matches
+    # the conversion heuristic (COMMERCIAL + has trial + lastUpdated == target)
+    # even though the real conversion happened days/weeks earlier. Drop those
+    # entitlements from both sections so we don't post a fake conversion AND a
+    # fake same-day-reinstall pair. A genuine same-day churn event for a brand-
+    # new entitlement (i.e. one with no prior commercial history) would still
+    # show up because there'd be no matching conversion row to conflict with.
+    un_ids = {r.get("licenseId") for r in un_rows if r.get("licenseId")}
+    lic_ids = {r.get("licenseId") for r in lic_rows_final if r.get("licenseId")}
+    conflicts = lic_ids & un_ids
+    if conflicts:
+        print(f"[INFO] Dropping {len(conflicts)} entitlement(s) appearing in both "
+              f"licenses and uninstalls (lastUpdated drift): {sorted(conflicts)}")
+        lic_rows_final = [r for r in lic_rows_final if r.get("licenseId") not in conflicts]
+        un_rows        = [r for r in un_rows        if r.get("licenseId") not in conflicts]
+
+    print(
+        f"[INFO] Licenses mapped: {len(lic_rows_final)} | "
+        f"Conversions inferred: {len(conv_rows)} | "
+        f"Renewals: {len(renew_rows)} | "
+        f"Uninstalls mapped: {len(un_rows)}"
+    )
+
+    if not lic_rows_final and not renew_rows and not un_rows:
+        slack_post({"text": f"ℹ️ No new licenses, renewals or uninstalls for {start_date} (UTC)."})
         print("[INFO] No items; posted 'no changes' message to Slack.")
         return
 
-    post_combined_to_slack(SLACK_WEBHOOK, lic_rows_final, un_rows, start_date, end_date)
+    post_combined_to_slack(SLACK_WEBHOOK, lic_rows_final, un_rows, start_date, end_date, renewal_rows=renew_rows)
 
 if __name__ == "__main__":
     try:
