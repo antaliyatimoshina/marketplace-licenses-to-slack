@@ -850,6 +850,74 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
         })
     return out
 
+def _render_table(headers, rows, aligns=None):
+    """
+    Render rows as a fixed-width plain-text table inside a Slack code block
+    (triple-backtick fence). Returns the full block including fences.
+
+    `aligns` is an optional list of "L" / "R" per column (default all "L").
+    Use "R" for numeric columns so the digits line up.
+    """
+    if aligns is None:
+        aligns = ["L"] * len(headers)
+
+    # Compute column widths from header + cell values
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            cell_str = "" if cell is None else str(cell)
+            if len(cell_str) > widths[i]:
+                widths[i] = len(cell_str)
+
+    def _fmt_row(cells):
+        parts = []
+        for i, cell in enumerate(cells):
+            cell_str = "" if cell is None else str(cell)
+            if aligns[i] == "R":
+                parts.append(cell_str.rjust(widths[i]))
+            else:
+                parts.append(cell_str.ljust(widths[i]))
+        return "  ".join(parts).rstrip()  # trim trailing spaces from last col
+
+    out = ["```", _fmt_row(headers)]
+    for row in rows:
+        out.append(_fmt_row(row))
+    out.append("```")
+    return "\n".join(out)
+
+
+def _format_contact_cell(name, email):
+    """Format the CONTACT column as 'Name <email>' / 'Name' / '<email>' / '—'."""
+    if name and email:
+        return f"{name} <{email}>"
+    if name:
+        return str(name)
+    if email:
+        return f"<{email}>"
+    return "—"
+
+
+def _format_ends_cell(end_str, target_date):
+    """
+    Format the ENDS column for the uninstalls section as
+    'YYYY-MM-DD (Nd)' for future dates, '... (today)' on the target day,
+    or 'YYYY-MM-DD (-Nd)' for past dates. Returns "" if no end date.
+    """
+    if not end_str:
+        return ""
+    s = end_str[:10] if isinstance(end_str, str) else str(end_str)
+    try:
+        end_dt = dt.date.fromisoformat(s)
+        delta = (end_dt - target_date).days
+        if delta > 0:
+            return f"{s} ({delta}d)"
+        if delta == 0:
+            return f"{s} (today)"
+        return f"{s} ({delta}d)"  # negative number renders as "-Nd"
+    except (ValueError, TypeError):
+        return s
+
+
 def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.date, end: dt.date, renewal_rows=None):
     """
     One message per appKey:
@@ -922,93 +990,87 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
         }
         un_rows = [e for e in un_rows if e.get("licenseId") not in active_ids]
     
-        # Conversions
+        # Conversions (trial → paid) — :moneybag:
         if paid_conversions:
-            lines = []
+            headers = ["CUSTOMER", "USERS", "TRIAL STARTED", "ENTITLEMENT", "CONTACT"]
+            aligns  = ["L",        "R",     "L",             "L",           "L"]
+            table_rows = []
             for e in paid_conversions:
-                contact = (
-                    f"{e['contactName']} ({e['contactEmail']})"
-                    if e.get("contactName") and e.get("contactEmail")
-                    else (e.get("contactName") or e.get("contactEmail") or "—")
-                )
-                users_part = f" · {e['users']} users" if e.get("users") else ""
-                id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
-                trial_part = f" (trial started {e['trialStarted']})" if e.get("trialStarted") else ""
-                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}{trial_part}")
-            section_chunks.append(":moneybag: Conversions (trial → paid)\n" + "\n".join(lines))
-    
-        # New licenses (non-conversions)
+                table_rows.append([
+                    e.get("customer") or "—",
+                    str(e["users"]) if e.get("users") else "",
+                    e.get("trialStarted") or "",
+                    e.get("licenseId") or "",
+                    _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
+                ])
+            section_chunks.append(
+                ":moneybag: *Conversions (trial → paid)*\n"
+                + _render_table(headers, table_rows, aligns)
+            )
+
+        # New licenses (non-conversions) — :airplane:
         if new_nonconversion:
-            lines = []
+            headers = ["CUSTOMER", "USERS", "TYPE", "ENTITLEMENT", "CONTACT"]
+            aligns  = ["L",        "R",     "L",    "L",           "L"]
+            table_rows = []
             for e in new_nonconversion:
-                contact = (
-                    f"{e['contactName']} ({e['contactEmail']})"
-                    if e.get("contactName") and e.get("contactEmail")
-                    else (e.get("contactName") or e.get("contactEmail") or "—")
-                )
+                # Trials get user count from evaluationOpportunitySize; paid
+                # licenses get it from the parsed tier string.
                 trial_users = e.get("trial_user_count")
                 if trial_users and e.get("licenseType") in ("EVALUATION", "EVAL", "TRIAL"):
-                    # For trials: show "10 users" based on evaluationOpportunitySize
-                    users_part = f" · {trial_users} users"
+                    users_value = trial_users
                 else:
-                    # For paid licenses: keep existing users count from tier
-                    users_part = f" · {e['users']} users" if e.get("users") else ""
-                id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
-                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
-            section_chunks.append(":airplane: New licenses\n" + "\n".join(lines))
+                    users_value = e.get("users")
+                table_rows.append([
+                    e.get("customer") or "—",
+                    str(users_value) if users_value else "",
+                    e.get("licenseType") or "",
+                    e.get("licenseId") or "",
+                    _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
+                ])
+            section_chunks.append(
+                ":airplane: *New licenses*\n"
+                + _render_table(headers, table_rows, aligns)
+            )
 
-        # License renewals (sourced from transactions where saleType == "Renewal")
+        # Paid renewals — :arrows_counterclockwise: (sourced from transactions
+        # where saleType == "Renewal", filtered to >10 users)
         if renew_rows:
-            lines = []
+            headers = ["CUSTOMER", "USERS", "ENTITLEMENT", "CONTACT"]
+            aligns  = ["L",        "R",     "L",           "L"]
+            table_rows = []
             for e in renew_rows:
-                contact = (
-                    f"{e['contactName']} ({e['contactEmail']})"
-                    if e.get("contactName") and e.get("contactEmail")
-                    else (e.get("contactName") or e.get("contactEmail") or "—")
-                )
-                users_part = f" · {e['users']} users" if e.get("users") else ""
-                id_part    = f" · {e['licenseId']}" if e.get("licenseId") else ""
-                lines.append(f"• {e['customer']} · {contact} · {e['licenseType']}{users_part}{id_part}")
-            section_chunks.append(":arrows_counterclockwise: Paid renewals\n" + "\n".join(lines))
+                table_rows.append([
+                    e.get("customer") or "—",
+                    str(e["users"]) if e.get("users") else "",
+                    e.get("licenseId") or "",
+                    _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
+                ])
+            section_chunks.append(
+                ":arrows_counterclockwise: *Paid renewals*\n"
+                + _render_table(headers, table_rows, aligns)
+            )
 
-        # Uninstalls / Unsubscribes — only true churn (same-day "reinstalls"
-        # already filtered out above). Each row is annotated with the license
-        # end date and days remaining so the team can prioritise outreach:
-        # short windows ("ends 2026-05-07 (7 days left)") are more urgent
-        # than long ones ("ends 2026-05-21 (22 days left)").
+        # Uninstalls / Unsubscribes — :heavy_minus_sign:
+        # Each row carries the license end date + days remaining so the team
+        # can prioritise outreach (small day counts = more urgent).
         if un_rows:
-            lines = []
+            headers = ["CUSTOMER", "USERS", "ENDS", "ACTION", "ENTITLEMENT", "CONTACT"]
+            aligns  = ["L",        "R",     "L",    "L",      "L",           "L"]
+            table_rows = []
             for e in un_rows:
-                contact = (
-                    f"{e['contactName']} ({e['contactEmail']})"
-                    if e.get("contactName") and e.get("contactEmail")
-                    else (e.get("contactName") or e.get("contactEmail") or "—")
-                )
-                users_part = f" · {e['users']} users" if e.get("users") else ""
-                id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""
-
-                # Compute "ends YYYY-MM-DD (N days left)" annotation.
-                end_part = ""
-                end_str = e.get("maintenanceEndDate")
-                if end_str:
-                    try:
-                        end_dt = dt.date.fromisoformat(end_str[:10])
-                        delta = (end_dt - start).days
-                        if delta > 0:
-                            end_part = f" · ends {end_str} ({delta} days left)"
-                        elif delta == 0:
-                            end_part = f" · ends today ({end_str})"
-                        else:
-                            end_part = f" · ended {end_str} ({-delta} days ago)"
-                    except (ValueError, TypeError):
-                        # Fall back to the raw string if parsing fails
-                        end_part = f" · ends {end_str}"
-
-                lines.append(
-                    f"• {e['customer']} · {contact} · {e['licenseType']}"
-                    f"{users_part}{id_part}{end_part}"
-                )
-            section_chunks.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
+                table_rows.append([
+                    e.get("customer") or "—",
+                    str(e["users"]) if e.get("users") else "",
+                    _format_ends_cell(e.get("maintenanceEndDate"), start),
+                    e.get("licenseType") or "",
+                    e.get("licenseId") or "",
+                    _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
+                ])
+            section_chunks.append(
+                ":heavy_minus_sign: *Uninstalls / Unsubscribes*\n"
+                + _render_table(headers, table_rows, aligns)
+            )
 
         # Skip apps whose only events were filtered out (e.g. "false" uninstalls
         # that turned out to be conversions/renewals on the same day).
@@ -1016,7 +1078,7 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
             continue
 
         parts.append(
-            f"{app_title} Marketplace Events ({date_label}, UTC)\n\n"
+            f"*{app_title} Marketplace Events ({date_label}, UTC)*\n\n"
             + "\n\n".join(section_chunks)
         )
 
