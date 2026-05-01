@@ -67,8 +67,16 @@ def infer_conversions_from_licenses(lic_items, target: dt.date):
 def build_entitlement_enrichment(*license_lists):
     """
     From licenses payloads, build a dict:
-      { entitlementNumber -> {"customer": ..., "contactName": ..., "contactEmail": ...} }
+      { entitlementNumber -> {
+          "customer": ...,
+          "contactName": ...,
+          "contactEmail": ...,
+          "maintenanceEndDate": "YYYY-MM-DD" | None,
+        }
+      }
     Uses contactDetails (technical/billing) and company when available.
+    maintenanceEndDate is the date the license stops being valid — used to
+    annotate uninstall/unsubscribe rows with "ends … (N days left)".
     """
     out = {}
     for lst in license_lists:
@@ -85,10 +93,19 @@ def build_entitlement_enrichment(*license_lists):
             name  = t.get("name")  or b.get("name")
             email = t.get("email") or b.get("email")
 
+            # Pull the license end date if available; field name varies.
+            maint_end = (
+                lic.get("maintenanceEndDate")
+                or lic.get("latestMaintenanceEndDate")
+            )
+            if isinstance(maint_end, str):
+                maint_end = maint_end[:10]
+
             out[ent] = {
                 "customer": comp,
                 "contactName": name,
                 "contactEmail": email,
+                "maintenanceEndDate": maint_end,
             }
     return out
 
@@ -311,13 +328,11 @@ def fetch_cloud_conversions(vendor_id: str, start: dt.date, end: dt.date):
 
                 data = r.json()
                 if isinstance(data, list):
-                    print(f"[INFO] transactions: {url} → {len(data)} item(s)")
                     return data
                 if isinstance(data, dict):
                     for k in ("transactions", "items", "data", "results", "values"):
                         items = data.get(k)
                         if isinstance(items, list):
-                            print(f"[INFO] transactions: {url} → {len(items)} item(s) (under '{k}')")
                             return items
                     attempts.append((status, r.url, f"unexpected JSON keys={list(data.keys())}"))
                     continue
@@ -409,17 +424,24 @@ def day_window_utc():
 # Pick the reporting day (yesterday by default, or DAY=YYYY-MM-DD for backfill)
 start_date, end_date = day_window_utc()
 
-def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date):
+def fetch_licenses(vendor_id: str, start: dt.date, end: dt.date, dateType: str = "start"):
     """
     Fetch licenses via the EXPORT endpoint (JSON) for a UTC date window.
     Robust to payload being either a list or an object wrapper.
+
+    `dateType` controls which date field the API filters on:
+      - "start"        — license maintenance/evaluation start date (default;
+                         what conversion detection needs)
+      - "lastUpdated"  — license record's lastUpdated timestamp (catches
+                         recently-touched licenses regardless of when they
+                         originally started — used for enriching feedback rows)
     """
     base = "https://marketplace.atlassian.com"
     url = f"{base}/rest/2/vendors/{vendor_id}/reporting/licenses/export"
     params = {
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
-        "dateType": "start",        # filter by license start date
+        "dateType": dateType,
         "accept": "json",           # export API returns JSON when accept=json
         "withDataInsights": "true", # include evaluation/customer fields
     }
@@ -758,6 +780,15 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
         ent_id = f.get("appEntitlementNumber") or f.get("entitlementNumber")
         users  = f.get("users") or f.get("seats") or f.get("quantity")
 
+        # License end date — try the feedback payload first, fall back to
+        # ent_map. Used to annotate the row with "ends … (N days left)".
+        maint_end = (
+            f.get("maintenanceEndDate")
+            or f.get("latestMaintenanceEndDate")
+        )
+        if isinstance(maint_end, str):
+            maint_end = maint_end[:10]
+
         # enrichment from licenses by entitlement number
         if ent_map and ent_id:
             info = ent_map.get(ent_id)
@@ -768,6 +799,8 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
                     name = info.get("contactName")
                 if not email:
                     email = info.get("contactEmail")
+                if not maint_end:
+                    maint_end = info.get("maintenanceEndDate")
 
         # human labels (optional)
         ACTION_LABELS = {
@@ -786,6 +819,7 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
             "licenseType": label,
             "users": users,
             "licenseId": ent_id,
+            "maintenanceEndDate": maint_end,
         })
     return out
 
@@ -911,7 +945,10 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
             section_chunks.append(":arrows_counterclockwise: Paid renewals\n" + "\n".join(lines))
 
         # Uninstalls / Unsubscribes — only true churn (same-day "reinstalls"
-        # already filtered out above).
+        # already filtered out above). Each row is annotated with the license
+        # end date and days remaining so the team can prioritise outreach:
+        # short windows ("ends 2026-05-07 (7 days left)") are more urgent
+        # than long ones ("ends 2026-05-21 (22 days left)").
         if un_rows:
             lines = []
             for e in un_rows:
@@ -922,9 +959,27 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
                 )
                 users_part = f" · {e['users']} users" if e.get("users") else ""
                 id_part = f" · {e['licenseId']}" if e.get("licenseId") else ""
+
+                # Compute "ends YYYY-MM-DD (N days left)" annotation.
+                end_part = ""
+                end_str = e.get("maintenanceEndDate")
+                if end_str:
+                    try:
+                        end_dt = dt.date.fromisoformat(end_str[:10])
+                        delta = (end_dt - start).days
+                        if delta > 0:
+                            end_part = f" · ends {end_str} ({delta} days left)"
+                        elif delta == 0:
+                            end_part = f" · ends today ({end_str})"
+                        else:
+                            end_part = f" · ended {end_str} ({-delta} days ago)"
+                    except (ValueError, TypeError):
+                        # Fall back to the raw string if parsing fails
+                        end_part = f" · ends {end_str}"
+
                 lines.append(
                     f"• {e['customer']} · {contact} · {e['licenseType']}"
-                    f"{users_part}{id_part}"
+                    f"{users_part}{id_part}{end_part}"
                 )
             section_chunks.append(":heavy_minus_sign: Uninstalls / Unsubscribes\n" + "\n".join(lines))
 
@@ -953,8 +1008,18 @@ def main():
 
     # 2a) Wide fetch for conversion inference (uses lastUpdated on the target date)
     wide_start = start_date - dt.timedelta(days=CONVERSION_LOOKBACK_DAYS)
-    lic_items_wide = fetch_licenses(VENDOR_ID, wide_start, end_date)   # existing function
-    # build entitlement -> customer/contact enrichment
+    lic_items_wide = fetch_licenses(VENDOR_ID, wide_start, end_date)   # dateType=start
+
+    # Note: Atlassian's licenses/export endpoint on this tenant only accepts
+    # dateType=start (other values like last_updated, lastUpdated, updated all
+    # return 400). That means the wide fetch above is the sole source of
+    # license records for the enrichment map, and any license whose start
+    # predates `wide_start` won't be enrichable. CONVERSION_LOOKBACK_DAYS=90
+    # is wide enough to catch ordinary cases — if an unsubscribe ever lands
+    # on a license older than that, the row will degrade to "Unknown · —"
+    # rather than failing. If/when that becomes a problem, options are to
+    # widen the lookback further or look up specific entitlements via a
+    # different endpoint (e.g. /reporting/licenses/details/{entitlementId}).
     ent_map = build_entitlement_enrichment(lic_items_wide)
 
     inferred_raw = infer_conversions_from_licenses(lic_items_wide, start_date)
@@ -1002,22 +1067,22 @@ def main():
 
     # Cross-feed conflict resolution.
     # An entitlement that appears in BOTH the licenses/conversions feed AND the
-    # uninstalls feed for the same UTC day is almost always `lastUpdated` drift —
+    # uninstalls feed for the same UTC day is almost always `lastUpdated` drift:
     # the unsubscribe event re-touched the license record, which then matches
     # the conversion heuristic (COMMERCIAL + has trial + lastUpdated == target)
-    # even though the real conversion happened days/weeks earlier. Drop those
-    # entitlements from both sections so we don't post a fake conversion AND a
-    # fake same-day-reinstall pair. A genuine same-day churn event for a brand-
-    # new entitlement (i.e. one with no prior commercial history) would still
-    # show up because there'd be no matching conversion row to conflict with.
+    # even though the real conversion happened days/weeks earlier.
+    #
+    # The fix is one-sided: drop the false conversion from the licenses feed,
+    # but KEEP the unsubscribe row in the uninstalls feed. The unsubscribe is
+    # a real, actionable churn signal — for an active long-running customer,
+    # this is their 30-day notice that they've turned off auto-renewal. The
+    # only thing that's noise is the duplicated "conversion" appearance.
     un_ids = {r.get("licenseId") for r in un_rows if r.get("licenseId")}
     lic_ids = {r.get("licenseId") for r in lic_rows_final if r.get("licenseId")}
     conflicts = lic_ids & un_ids
     if conflicts:
-        print(f"[INFO] Dropping {len(conflicts)} entitlement(s) appearing in both "
-              f"licenses and uninstalls (lastUpdated drift): {sorted(conflicts)}")
         lic_rows_final = [r for r in lic_rows_final if r.get("licenseId") not in conflicts]
-        un_rows        = [r for r in un_rows        if r.get("licenseId") not in conflicts]
+        # Note: deliberately NOT removing from un_rows. The unsubscribe is real.
 
     print(
         f"[INFO] Licenses mapped: {len(lic_rows_final)} | "
