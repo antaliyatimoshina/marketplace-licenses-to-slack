@@ -72,12 +72,18 @@ def build_entitlement_enrichment(*license_lists):
           "contactName": ...,
           "contactEmail": ...,
           "maintenanceEndDate": "YYYY-MM-DD" | None,
+          "users": int | None,
         }
       }
     Uses contactDetails (technical/billing) and company when available.
     maintenanceEndDate is the date the license stops being valid — used to
     annotate uninstall/unsubscribe rows with "ends … (N days left)".
+    users is parsed from the license `tier` string (e.g., "11 Users" → 11)
+    and used as a fallback for rows whose source feed doesn't carry the
+    user count (the feedback feed typically doesn't).
     """
+    import re
+
     out = {}
     for lst in license_lists:
         for lic in (lst or []):
@@ -101,11 +107,30 @@ def build_entitlement_enrichment(*license_lists):
             if isinstance(maint_end, str):
                 maint_end = maint_end[:10]
 
+            # Extract user count: parse from the tier string first, then
+            # fall back to direct numeric fields if present.
+            users = None
+            tier = lic.get("tier")
+            if isinstance(tier, str):
+                m = re.search(r"(\d+)\s*Users?", tier, re.I)
+                if m:
+                    users = int(m.group(1))
+            if users is None:
+                for k in ("users", "seats", "quantity"):
+                    v = lic.get(k)
+                    if isinstance(v, int):
+                        users = v
+                        break
+                    if isinstance(v, str) and v.isdigit():
+                        users = int(v)
+                        break
+
             out[ent] = {
                 "customer": comp,
                 "contactName": name,
                 "contactEmail": email,
                 "maintenanceEndDate": maint_end,
+                "users": users,
             }
     return out
 
@@ -801,6 +826,8 @@ def pick_uninstalls(items, name_map=None, ent_map=None):
                     email = info.get("contactEmail")
                 if not maint_end:
                     maint_end = info.get("maintenanceEndDate")
+                if not users:
+                    users = info.get("users")
 
         # human labels (optional)
         ACTION_LABELS = {
