@@ -897,6 +897,49 @@ def _format_contact_cell(name, email):
     return "—"
 
 
+def _format_customer_cell(customer, license_id):
+    """
+    Customer cell with entitlement-as-fallback. When the company name is
+    missing (Atlassian sometimes returns "Unknown" / "—" / nothing for
+    customers with no filled-in company), substitute the entitlement number
+    so the row is still traceable back to the marketplace transactions UI.
+    """
+    if customer and str(customer).strip() and str(customer).strip() not in ("—", "Unknown"):
+        return str(customer)
+    if license_id:
+        return str(license_id)
+    return "—"
+
+
+def _effective_users(row):
+    """
+    The user count to display / sort by. For evaluations, prefer the
+    trial_user_count (parsed from evaluationOpportunitySize) over the
+    bare `users` field, which is None for trials; for everything else
+    fall back to the regular `users`.
+    """
+    trial = row.get("trial_user_count")
+    if trial and row.get("licenseType") in ("EVALUATION", "EVAL", "TRIAL"):
+        return trial
+    return row.get("users")
+
+
+def _sort_by_users_desc(rows):
+    """
+    Sort rows by user count, highest first. Rows whose count we couldn't
+    determine (None / non-numeric) sink to the bottom — they're typically
+    less actionable than ones with a known size.
+    """
+    def _key(r):
+        u = _effective_users(r)
+        if isinstance(u, int):
+            return u
+        if isinstance(u, str) and u.isdigit():
+            return int(u)
+        return 0
+    return sorted(rows, key=_key, reverse=True)
+
+
 def _format_ends_cell(end_str, target_date):
     """
     Format the ENDS column for the uninstalls section as
@@ -992,15 +1035,15 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
     
         # Conversions (trial → paid) — :moneybag:
         if paid_conversions:
-            headers = ["CUSTOMER", "USERS", "TRIAL STARTED", "ENTITLEMENT", "CONTACT"]
-            aligns  = ["L",        "R",     "L",             "L",           "L"]
+            headers = ["CUSTOMER", "USERS", "TRIAL STARTED", "CONTACT"]
+            aligns  = ["L",        "R",     "L",             "L"]
             table_rows = []
-            for e in paid_conversions:
+            for e in _sort_by_users_desc(paid_conversions):
+                u = _effective_users(e)
                 table_rows.append([
-                    e.get("customer") or "—",
-                    str(e["users"]) if e.get("users") else "",
+                    _format_customer_cell(e.get("customer"), e.get("licenseId")),
+                    str(u) if u else "",
                     e.get("trialStarted") or "",
-                    e.get("licenseId") or "",
                     _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
                 ])
             section_chunks.append(
@@ -1009,23 +1052,18 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
             )
 
         # New licenses (non-conversions) — :airplane:
+        # In practice these are almost always EVALUATION (trials). A direct
+        # paid purchase without a trial would appear here too without a TYPE
+        # marker — rare for cloud Marketplace apps.
         if new_nonconversion:
-            headers = ["CUSTOMER", "USERS", "TYPE", "ENTITLEMENT", "CONTACT"]
-            aligns  = ["L",        "R",     "L",    "L",           "L"]
+            headers = ["CUSTOMER", "USERS", "CONTACT"]
+            aligns  = ["L",        "R",     "L"]
             table_rows = []
-            for e in new_nonconversion:
-                # Trials get user count from evaluationOpportunitySize; paid
-                # licenses get it from the parsed tier string.
-                trial_users = e.get("trial_user_count")
-                if trial_users and e.get("licenseType") in ("EVALUATION", "EVAL", "TRIAL"):
-                    users_value = trial_users
-                else:
-                    users_value = e.get("users")
+            for e in _sort_by_users_desc(new_nonconversion):
+                u = _effective_users(e)
                 table_rows.append([
-                    e.get("customer") or "—",
-                    str(users_value) if users_value else "",
-                    e.get("licenseType") or "",
-                    e.get("licenseId") or "",
+                    _format_customer_cell(e.get("customer"), e.get("licenseId")),
+                    str(u) if u else "",
                     _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
                 ])
             section_chunks.append(
@@ -1036,14 +1074,14 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
         # Paid renewals — :arrows_counterclockwise: (sourced from transactions
         # where saleType == "Renewal", filtered to >10 users)
         if renew_rows:
-            headers = ["CUSTOMER", "USERS", "ENTITLEMENT", "CONTACT"]
-            aligns  = ["L",        "R",     "L",           "L"]
+            headers = ["CUSTOMER", "USERS", "CONTACT"]
+            aligns  = ["L",        "R",     "L"]
             table_rows = []
-            for e in renew_rows:
+            for e in _sort_by_users_desc(renew_rows):
+                u = _effective_users(e)
                 table_rows.append([
-                    e.get("customer") or "—",
-                    str(e["users"]) if e.get("users") else "",
-                    e.get("licenseId") or "",
+                    _format_customer_cell(e.get("customer"), e.get("licenseId")),
+                    str(u) if u else "",
                     _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
                 ])
             section_chunks.append(
@@ -1053,18 +1091,21 @@ def post_combined_to_slack(webhook, licenses_rows, uninstall_rows, start: dt.dat
 
         # Uninstalls / Unsubscribes — :heavy_minus_sign:
         # Each row carries the license end date + days remaining so the team
-        # can prioritise outreach (small day counts = more urgent).
+        # can prioritise outreach (small day counts = more urgent). The
+        # ACTION column distinguishes UNSUBSCRIBE (still active until end
+        # date — outreach window) from UNINSTALL/DISABLE (customer already
+        # stopped using; days-left becomes less actionable).
         if un_rows:
-            headers = ["CUSTOMER", "USERS", "ENDS", "ACTION", "ENTITLEMENT", "CONTACT"]
-            aligns  = ["L",        "R",     "L",    "L",      "L",           "L"]
+            headers = ["CUSTOMER", "USERS", "ENDS", "ACTION", "CONTACT"]
+            aligns  = ["L",        "R",     "L",    "L",      "L"]
             table_rows = []
-            for e in un_rows:
+            for e in _sort_by_users_desc(un_rows):
+                u = _effective_users(e)
                 table_rows.append([
-                    e.get("customer") or "—",
-                    str(e["users"]) if e.get("users") else "",
+                    _format_customer_cell(e.get("customer"), e.get("licenseId")),
+                    str(u) if u else "",
                     _format_ends_cell(e.get("maintenanceEndDate"), start),
                     e.get("licenseType") or "",
-                    e.get("licenseId") or "",
                     _format_contact_cell(e.get("contactName"), e.get("contactEmail")),
                 ])
             section_chunks.append(
